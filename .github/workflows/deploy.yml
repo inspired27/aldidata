@@ -9,39 +9,80 @@ jobs:
     runs-on: self-hosted
 
     steps:
-      - name: Deploy
+      - name: Deploy with automatic rollback
         shell: bash
         run: |
           set -euo pipefail
 
-          cd /opt/aldiapp/app
+          APP_DIR="/opt/aldiapp/app"
+          SERVICE="aldiapp"
+          HEALTH_URL="http://127.0.0.1:5000/"
+          WAIT_SECONDS=30
 
+          cd "$APP_DIR"
+
+          echo "== Capture current commit for rollback =="
+          PREV_COMMIT="$(git rev-parse HEAD)"
+          echo "PREV_COMMIT=$PREV_COMMIT"
+
+          echo "== Update code to origin/main =="
           git fetch origin
           git reset --hard origin/main
+          NEW_COMMIT="$(git rev-parse HEAD)"
+          echo "NEW_COMMIT=$NEW_COMMIT"
 
-          # Ensure venv exists
+          echo "== Ensure venv exists =="
           if [ ! -d ".venv" ]; then
             python3 -m venv .venv
           fi
 
+          echo "== Install dependencies =="
           source .venv/bin/activate
           pip install --upgrade pip
           pip install -r requirements.txt
 
-          # Restart service
-          sudo systemctl restart aldiapp
+          echo "== Restart service =="
+          sudo systemctl restart "$SERVICE"
 
-          # Wait for app to come back (retry up to ~30s)
-          for i in {1..30}; do
-            if curl -fsS http://127.0.0.1:5000/ > /dev/null; then
-              echo "App is up."
-              exit 0
+          echo "== Health check (retry up to ${WAIT_SECONDS}s) =="
+          ok=0
+          for i in $(seq 1 "$WAIT_SECONDS"); do
+            if curl -fsS "$HEALTH_URL" > /dev/null; then
+              echo "✅ App is up on new commit."
+              ok=1
+              break
             fi
-            echo "Waiting for app... ($i/30)"
+            echo "Waiting for app... ($i/${WAIT_SECONDS})"
             sleep 1
           done
 
-          echo "App did not come back up in time."
-          sudo systemctl status aldiapp --no-pager || true
-          journalctl -u aldiapp -n 80 --no-pager || true
+          if [ "$ok" -eq 1 ]; then
+            exit 0
+          fi
+
+          echo "❌ Deploy failed: app did not come back up. Rolling back..."
+          echo "== Rollback to previous commit: $PREV_COMMIT =="
+          git reset --hard "$PREV_COMMIT"
+
+          echo "== Re-install dependencies for rollback commit =="
+          source .venv/bin/activate
+          pip install -r requirements.txt
+
+          echo "== Restart service after rollback =="
+          sudo systemctl restart "$SERVICE"
+
+          echo "== Health check after rollback (retry up to ${WAIT_SECONDS}s) =="
+          for i in $(seq 1 "$WAIT_SECONDS"); do
+            if curl -fsS "$HEALTH_URL" > /dev/null; then
+              echo "✅ Rollback succeeded: app is back up."
+              echo "⚠️ Marking workflow as failed so you notice the rollback."
+              exit 1
+            fi
+            echo "Waiting for app after rollback... ($i/${WAIT_SECONDS})"
+            sleep 1
+          done
+
+          echo "🚨 Rollback failed: app is still down."
+          sudo systemctl status "$SERVICE" --no-pager || true
+          journalctl -u "$SERVICE" -n 120 --no-pager || true
           exit 1
