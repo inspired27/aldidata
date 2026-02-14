@@ -393,6 +393,10 @@ def run_scheduled_set(mobile: str, value: str):
 # -----------------------
 # Routes
 # -----------------------
+@app.get("/healthz")
+def healthz():
+    return jsonify({"ok": True}), 200
+
 @app.route("/")
 def home():
     cfg = load_cfg()

@@ -16,7 +16,7 @@ jobs:
 
           APP_DIR="/opt/aldiapp/app"
           SERVICE="aldiapp"
-          HEALTH_URL="http://127.0.0.1:5000/"
+          HEALTH_URL="http://127.0.0.1:5000/healthz"
           WAIT_SECONDS=30
 
           cd "$APP_DIR"
