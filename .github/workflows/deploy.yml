@@ -31,5 +31,18 @@ jobs:
 
           sudo systemctl restart aldiapp
 
-          # Quick health check (fails workflow if app didn't come back)
-          curl -fsS http://127.0.0.1:5000/ > /dev/null
+          # Wait for app to come back (retry up to ~30s)
+          for i in {1..30}; do
+            if curl -fsS http://127.0.0.1:5000/ > /dev/null; then
+              echo "App is up."
+              exit 0
+            fi
+            echo "Waiting for app... ($i/30)"
+            sleep 1
+          done
+
+          echo "App did not come back up in time."
+          sudo systemctl status aldiapp --no-pager || true
+          journalctl -u aldiapp -n 80 --no-pager || true
+          exit 1
+
