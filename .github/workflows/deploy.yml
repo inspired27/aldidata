@@ -8,17 +8,13 @@ on:
 jobs:
   deploy:
     runs-on: self-hosted
-
     steps:
       - name: Deploy on self-hosted runner
         run: |
-          echo "Starting deployment..."
-
           cd /opt/aldiapp/app
-
           git fetch origin
           git reset --hard origin/main
-
           sudo systemctl restart aldiapp
 
-          echo "Deployment completed successfully."
+
+
