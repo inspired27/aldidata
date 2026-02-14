@@ -9,9 +9,9 @@ jobs:
     runs-on: self-hosted
 
     steps:
-      - name: Deploy on self-hosted runner
+      - name: Deploy
         run: |
-          set -e
+          set -euo pipefail
 
           cd /opt/aldiapp/app
 
@@ -26,8 +26,10 @@ jobs:
           source .venv/bin/activate
           pip install --upgrade pip
 
-          # Install dependencies
+          # Install dependencies (requires requirements.txt committed to repo)
           pip install -r requirements.txt
 
-          # Restart the real service
           sudo systemctl restart aldiapp
+
+          # Quick health check (fails workflow if app didn't come back)
+          curl -fsS http://127.0.0.1:5000/ > /dev/null
