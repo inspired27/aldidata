@@ -18,7 +18,7 @@ OVERVIEW_URL   = "https://my.aldimobile.com.au/admin/s/5620272/shareddataovervie
 LOGIN_PAGE_URL = "https://my.aldimobile.com.au/login/"
 LOGIN_POST_URL = "https://my.aldimobile.com.au/login_check"
 
-MOBILES = ["0466008129", "0466008170"]
+MOBILES = ["0494584269","0466008129", "0466008170"]
 CONFIG_PATH = os.path.join(os.path.dirname(__file__), "schedule_matrix.json")
 
 POLL_INTERVAL_SECONDS = 2
