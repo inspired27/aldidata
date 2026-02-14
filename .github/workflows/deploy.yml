@@ -2,19 +2,32 @@ name: Deploy to OCI VM
 
 on:
   push:
-    branches:
-      - main
+    branches: [main]
 
 jobs:
   deploy:
     runs-on: self-hosted
+
     steps:
       - name: Deploy on self-hosted runner
         run: |
+          set -e
+
           cd /opt/aldiapp/app
+
           git fetch origin
           git reset --hard origin/main
+
+          # Ensure venv exists
+          if [ ! -d ".venv" ]; then
+            python3 -m venv .venv
+          fi
+
+          source .venv/bin/activate
+          pip install --upgrade pip
+
+          # Install dependencies
+          pip install -r requirements.txt
+
+          # Restart the real service
           sudo systemctl restart aldiapp
-
-
-
