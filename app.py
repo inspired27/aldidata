@@ -989,25 +989,72 @@ input[type="text"]{width:100%;padding:8px;border-radius:8px;border:1px solid #cc
 </form>
 
 <script>
+window.copyDefaults = function(mobile){
+  try{
+    const days = ["mon", "tue", "wed", "thu", "fri", "sat", "sun"];
+    for(let i = 0; i < 4; i++){
+      const dt = document.getElementById(`default_time_${mobile}_${i}`);
+      const dv = document.getElementById(`default_value_${mobile}_${i}`);
+      if(!dt || !dv){
+        console.warn("[copyDefaults] missing default inputs", {mobile, i, dt: !!dt, dv: !!dv});
+        return false;
+      }
 
-document.addEventListener("click", function(e){
-  const btn = e.target.closest("button");
-  if(!btn) return;
-
-  const txt = (btn.textContent || "").toLowerCase();
-  if(!txt.includes("copy defaults")) return;
-
-  // Never submit forms
-  e.preventDefault();
-
-  const mobile = btn.getAttribute("data-mobile") || btn.dataset.mobile;
-  if(!mobile){
-    console.warn("[copyDefaults] button missing data-mobile");
-    return;
+      const t = dt.value || "";
+      const v = dv.value || "";
+      for(const d of days){
+        const ti = document.getElementById(`time_${mobile}_${d}_${i}`);
+        const vi = document.getElementById(`value_${mobile}_${d}_${i}`);
+        if(ti) ti.value = t;
+        if(vi) vi.value = v;
+      }
+    }
+    return false;
+  }catch(e){
+    console.error("copyDefaults failed", e);
+    alert("Copy Defaults failed — open browser console for details.");
+    return false;
   }
-  copyDefaults(mobile);
-});
+};
 
+window.copyDefaultsAndSave = async function(mobile){
+  try{
+    if (typeof window.copyDefaults === "function") {
+      window.copyDefaults(mobile);
+    }
+
+    const defaults = [];
+    for (let i = 0; i < 4; i++) {
+      const dt = document.getElementById(`default_time_${mobile}_${i}`);
+      const dv = document.getElementById(`default_value_${mobile}_${i}`);
+      defaults.push({
+        time: dt ? (dt.value || "") : "",
+        value: dv ? (dv.value || "") : ""
+      });
+    }
+
+    const r = await fetch("/matrix-copy-defaults", {
+      method: "POST",
+      headers: {"Content-Type": "application/json"},
+      body: JSON.stringify({mobile: mobile, defaults: defaults})
+    });
+
+    let j = null;
+    try { j = await r.json(); } catch(e) {}
+    if(!r.ok || !j || !j.ok){
+      console.error("matrix-copy-defaults failed", r.status, j);
+      alert("Copy Defaults save failed. Check logs/console.");
+      return false;
+    }
+
+    window.location.reload();
+    return false;
+  }catch(e){
+    console.error("copyDefaultsAndSave failed", e);
+    alert("Copy Defaults save failed — open console for details.");
+    return false;
+  }
+};
 </script>
 </body>
 </html>
