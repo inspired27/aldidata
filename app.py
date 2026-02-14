@@ -861,6 +861,10 @@ input[type="text"]{width:100%;padding:8px;border-radius:8px;border:1px solid #cc
 .btn{display:inline-block;padding:10px 14px;border-radius:10px;border:1px solid #ccc;background:#f3f3f3;text-decoration:none;color:#000}
 .savebtn{width:100%;padding:12px;border-radius:10px;border:1px solid #ccc;background:#f3f3f3;font-size:16px;cursor:pointer}
 .flex{display:flex;gap:10px;flex-wrap:wrap;align-items:center}
+.table-scroll{overflow-x:auto;-webkit-overflow-scrolling:touch}
+.slot-table{min-width:560px}
+.slot-table th,.slot-table td{min-width:105px}
+.slot-table th:first-child,.slot-table td:first-child{min-width:90px}
 </style>
 </head>
 <body>
@@ -899,7 +903,8 @@ input[type="text"]{width:100%;padding:8px;border-radius:8px;border:1px solid #cc
       <div class="small">Set these 4 slots, then copy them down to every day.</div>
 
 
-      <table>
+      <div class="table-scroll">
+      <table class="slot-table">
 
 
         <tr>
@@ -945,6 +950,7 @@ input[type="text"]{width:100%;padding:8px;border-radius:8px;border:1px solid #cc
 
 
       </table>
+      </div>
 
 
       <div style="margin-top:10px;">
@@ -961,7 +967,8 @@ input[type="text"]{width:100%;padding:8px;border-radius:8px;border:1px solid #cc
 
 
     <div style="margin-top:12px;">
-      <table>
+      <div class="table-scroll">
+      <table class="slot-table">
         <tr>
           <th>Day</th>
           {% for i in range(4) %}<th>Slot {{i+1}}</th>{% endfor %}
@@ -981,6 +988,7 @@ input[type="text"]{width:100%;padding:8px;border-radius:8px;border:1px solid #cc
         </tr>
         {% endfor %}
       </table>
+      </div>
     </div>
   </div>
   {% endfor %}
