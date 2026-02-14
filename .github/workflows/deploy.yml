@@ -47,12 +47,12 @@ jobs:
           echo "== Health check (retry up to ${WAIT_SECONDS}s) =="
           ok=0
           for i in $(seq 1 "$WAIT_SECONDS"); do
-            if curl -fsS "$HEALTH_URL" > /dev/null; then
+            if curl -fsS --connect-timeout 2 --max-time 2 "$HEALTH_URL" > /dev/null; then
               echo "✅ App is up on new commit."
               ok=1
               break
             fi
-            echo "Waiting for app... ($i/${WAIT_SECONDS})"
+            echo "Waiting for app... ($i/${WAIT_SECONDS}) $(date -u +%H:%M:%S)"
             sleep 1
           done
 
@@ -73,12 +73,12 @@ jobs:
 
           echo "== Health check after rollback (retry up to ${WAIT_SECONDS}s) =="
           for i in $(seq 1 "$WAIT_SECONDS"); do
-            if curl -fsS "$HEALTH_URL" > /dev/null; then
+            if curl -fsS --connect-timeout 2 --max-time 2 "$HEALTH_URL" > /dev/null; then
               echo "✅ Rollback succeeded: app is back up."
               echo "⚠️ Marking workflow as failed so you notice the rollback."
               exit 1
             fi
-            echo "Waiting for app after rollback... ($i/${WAIT_SECONDS})"
+            echo "Waiting for app after rollback... ($i/${WAIT_SECONDS}) $(date -u +%H:%M:%S)"
             sleep 1
           done
 
