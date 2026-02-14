@@ -10,6 +10,7 @@ jobs:
 
     steps:
       - name: Deploy
+        shell: bash
         run: |
           set -euo pipefail
 
@@ -25,10 +26,9 @@ jobs:
 
           source .venv/bin/activate
           pip install --upgrade pip
-
-          # Install dependencies (requires requirements.txt committed to repo)
           pip install -r requirements.txt
 
+          # Restart service
           sudo systemctl restart aldiapp
 
           # Wait for app to come back (retry up to ~30s)
@@ -45,4 +45,3 @@ jobs:
           sudo systemctl status aldiapp --no-pager || true
           journalctl -u aldiapp -n 80 --no-pager || true
           exit 1
-
