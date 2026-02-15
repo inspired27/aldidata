@@ -24,7 +24,6 @@ CONFIG_PATH = os.path.join(os.path.dirname(__file__), "schedule_matrix.json")
 POLL_INTERVAL_SECONDS = 2
 POLL_TIMEOUT_SECONDS = 45
 CACHE_TTL_SECONDS = 5
-UPSTREAM_UNREACHABLE_MSG = "Unable to reach ALDI Mobile (outbound blocked)"
 
 app = Flask(__name__)
 
@@ -60,13 +59,6 @@ def _http_post(url: str, **kwargs) -> requests.Response:
     except requests.RequestException as e:
         app.logger.exception("Outbound POST failed for path=%s err=%s", _url_path(url), e.__class__.__name__)
         raise
-
-def public_error_message(err: Exception) -> str:
-    if isinstance(err, (requests.exceptions.ConnectionError, requests.exceptions.Timeout, requests.exceptions.ProxyError)):
-        return UPSTREAM_UNREACHABLE_MSG
-    if isinstance(err, requests.exceptions.HTTPError):
-        return "ALDI Mobile request failed"
-    return "Operation failed"
 
 cache = {}
 
@@ -503,8 +495,7 @@ def home():
         try:
             cur, st = get_limit_text_and_status(m, op_id=None)
         except Exception as e:
-            app.logger.exception("Failed to load current status for mobile=%s", m)
-            cur, st = f"Error: {public_error_message(e)}", "Error"
+            cur, st = f"Error: {e}", "Error"
         item = {"mobile": m, "enabled": enabled, "current": cur, "status": st}
         if next_change:
             item.update(next_change)
@@ -891,8 +882,7 @@ def api_set_now_start():
             progress_set(op_id, "Done.")
             progress_done(op_id, True, res)
         except Exception as e:
-            app.logger.exception("Manual update failed for mobile=%s", mobile)
-            progress_done(op_id, False, {"error": public_error_message(e)})
+            progress_done(op_id, False, {"error": str(e)})
 
     threading.Thread(target=worker, daemon=True).start()
     return jsonify({"ok": True, "op_id": op_id})
@@ -903,25 +893,15 @@ def api_refresh_start():
 
     def worker():
         try:
-            had_upstream_error = False
             for i, m in enumerate(MOBILES, start=1):
                 progress_set(op_id, f"Refreshing {m} ({i}/{len(MOBILES)})...")
                 try:
                     get_limit_text_and_status(m, op_id=op_id)
                 except Exception as e:
-                    app.logger.exception("Refresh failed for mobile=%s", m)
-                    msg = public_error_message(e)
-                    if msg == UPSTREAM_UNREACHABLE_MSG:
-                        had_upstream_error = True
-                    cache_set(m, f"Error: {msg}", "Error")
-
-            if had_upstream_error:
-                progress_done(op_id, False, {"error": f"{UPSTREAM_UNREACHABLE_MSG}. Refresh could not contact upstream."})
-            else:
-                progress_done(op_id, True, {"refreshed": True})
+                    cache_set(m, f"Error: {e}", "Error")
+            progress_done(op_id, True, {"refreshed": True})
         except Exception as e:
-            app.logger.exception("Refresh operation failed")
-            progress_done(op_id, False, {"error": public_error_message(e)})
+            progress_done(op_id, False, {"error": str(e)})
 
     threading.Thread(target=worker, daemon=True).start()
     return jsonify({"ok": True, "op_id": op_id})
