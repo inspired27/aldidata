@@ -645,7 +645,7 @@ a{color:#1a5cff;text-decoration:none}
 </head>
 <body>
 
-<div id="spinnerOverlay" class="spinner-overlay">
+<div id="spinnerOverlay" class="spinner-overlay" style="display:flex;">
   <div style="display:flex;flex-direction:column;align-items:center;gap:12px;">
     <div class="spinner"></div>
     <div id="progressText" style="font-size:14px;color:#333;text-align:center;max-width:320px;">Loading...</div>
@@ -711,11 +711,6 @@ function setProgress(msg){
   document.getElementById("progressText").innerText = msg || "Working...";
 }
 function hideOverlay(){ document.getElementById("spinnerOverlay").style.display="none"; }
-
-window.addEventListener("load", () => hideOverlay());
-window.addEventListener("pageshow", (e) => {
-  if (e.persisted) hideOverlay();
-});
 
 function navMessageForHref(href){
   const low = (href || "").toLowerCase();
@@ -803,6 +798,11 @@ async function refreshNow(){
   }
   pollProgress(j.op_id);
 }
+</script>
+
+<script>
+window.addEventListener("load", () => hideOverlay());
+window.addEventListener("pageshow", (e) => { if (e.persisted) hideOverlay(); });
 </script>
 
 
