@@ -4,7 +4,7 @@ import requests
 from bs4 import BeautifulSoup
 from urllib.parse import urljoin, urlparse
 import time, json, os
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 import uuid, threading
 
 from apscheduler.schedulers.background import BackgroundScheduler
@@ -24,17 +24,72 @@ CONFIG_PATH = os.path.join(os.path.dirname(__file__), "schedule_matrix.json")
 POLL_INTERVAL_SECONDS = 2
 POLL_TIMEOUT_SECONDS = 45
 CACHE_TTL_SECONDS = 5
-UPSTREAM_UNREACHABLE_MSG = "Unable to reach ALDI Mobile (outbound blocked)"
+OUTBOUND_PROXY_URL = os.getenv("OUTBOUND_PROXY_URL", "").strip()
+UPSTREAM_UNREACHABLE_MSG = "Cannot connect to ALDI Mobile (network/DNS)."
 
 app = Flask(__name__)
 
 _SESSION = None
+
+class UpstreamError(Exception):
+    def __init__(self, error_code: str, user_message: str, stage: str = "", *, http_status: int | None = None):
+        super().__init__(user_message)
+        self.error_code = error_code
+        self.user_message = user_message
+        self.stage = stage
+        self.http_status = http_status
+
+def _http_error_code(status_code: int) -> str:
+    if status_code == 403:
+        return "HTTP_403"
+    if 500 <= status_code <= 599:
+        return "HTTP_5XX"
+    return f"HTTP_{status_code}"
+
+def _http_error_message(status_code: int) -> str:
+    if status_code == 403:
+        return "ALDI Mobile refused access (HTTP 403)."
+    if 500 <= status_code <= 599:
+        return "ALDI Mobile is unavailable (HTTP 5xx)."
+    return f"ALDI Mobile request failed (HTTP {status_code})."
+
+def _classify_request_exception(err: Exception) -> tuple[str, str]:
+    if isinstance(err, requests.exceptions.SSLError):
+        return "TLS_FAIL", "Cannot establish a secure connection to ALDI Mobile (TLS)."
+    if isinstance(err, requests.exceptions.Timeout):
+        return "OUTBOUND_TIMEOUT", "Cannot connect to ALDI Mobile (network/DNS)."
+    if isinstance(err, requests.exceptions.ConnectionError):
+        low = str(err).lower()
+        dns_markers = [
+            "name resolution",
+            "name or service not known",
+            "temporary failure in name resolution",
+            "nodename nor servname",
+            "getaddrinfo",
+            "failed to resolve",
+        ]
+        if any(m in low for m in dns_markers):
+            return "DNS_FAIL", "Cannot connect to ALDI Mobile (network/DNS)."
+        return "OUTBOUND_CONNECT_FAIL", "Cannot connect to ALDI Mobile (network/DNS)."
+    return "OUTBOUND_REQUEST_FAIL", "ALDI Mobile request failed."
+
+def _error_code_from_exception(err: Exception) -> str:
+    if isinstance(err, UpstreamError):
+        return err.error_code
+    code, _ = _classify_request_exception(err)
+    return code
+
+def _error_timestamp() -> str:
+    return datetime.now(timezone.utc).isoformat(timespec="seconds")
 
 def get_session() -> requests.Session:
     global _SESSION
     if _SESSION is None:
         _SESSION = requests.Session()
         _SESSION.trust_env = False  # ignore HTTP(S)_PROXY and related environment config
+        if OUTBOUND_PROXY_URL:
+            _SESSION.proxies.update({"http": OUTBOUND_PROXY_URL, "https": OUTBOUND_PROXY_URL})
+            app.logger.info("Using explicit outbound proxy from OUTBOUND_PROXY_URL")
         _SESSION.headers.update({
             "User-Agent": "Mozilla/5.0",
             "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
@@ -49,19 +104,47 @@ def _url_path(url: str) -> str:
 
 def _http_get(url: str, **kwargs) -> requests.Response:
     try:
-        return get_session().get(url, timeout=30, allow_redirects=True, **kwargs)
+        kwargs.setdefault("timeout", 30)
+        kwargs.setdefault("allow_redirects", True)
+        return get_session().get(url, **kwargs)
     except requests.RequestException as e:
-        app.logger.exception("Outbound GET failed for path=%s err=%s", _url_path(url), e.__class__.__name__)
-        raise
+        code, msg = _classify_request_exception(e)
+        stage = f"GET {_url_path(url)}"
+        app.logger.exception("Outbound GET failed path=%s code=%s exc=%s", _url_path(url), code, e.__class__.__name__)
+        raise UpstreamError(code, msg, stage=stage) from e
 
 def _http_post(url: str, **kwargs) -> requests.Response:
     try:
-        return get_session().post(url, timeout=30, allow_redirects=True, **kwargs)
+        kwargs.setdefault("timeout", 30)
+        kwargs.setdefault("allow_redirects", True)
+        return get_session().post(url, **kwargs)
     except requests.RequestException as e:
-        app.logger.exception("Outbound POST failed for path=%s err=%s", _url_path(url), e.__class__.__name__)
-        raise
+        code, msg = _classify_request_exception(e)
+        stage = f"POST {_url_path(url)}"
+        app.logger.exception("Outbound POST failed path=%s code=%s exc=%s", _url_path(url), code, e.__class__.__name__)
+        raise UpstreamError(code, msg, stage=stage) from e
+
+def _http_head(url: str, **kwargs) -> requests.Response:
+    try:
+        kwargs.setdefault("timeout", 5)
+        kwargs.setdefault("allow_redirects", True)
+        return get_session().head(url, **kwargs)
+    except requests.RequestException as e:
+        code, msg = _classify_request_exception(e)
+        stage = f"HEAD {_url_path(url)}"
+        app.logger.exception("Outbound HEAD failed path=%s code=%s exc=%s", _url_path(url), code, e.__class__.__name__)
+        raise UpstreamError(code, msg, stage=stage) from e
+
+def _raise_if_http_error(r: requests.Response, method: str, url: str):
+    if r.status_code >= 400:
+        code = _http_error_code(r.status_code)
+        stage = f"{method} {_url_path(url)}"
+        app.logger.warning("Outbound %s status=%s path=%s code=%s", method, r.status_code, _url_path(url), code)
+        raise UpstreamError(code, _http_error_message(r.status_code), stage=stage, http_status=r.status_code)
 
 def public_error_message(err: Exception) -> str:
+    if isinstance(err, UpstreamError):
+        return err.user_message
     if isinstance(err, (requests.exceptions.ConnectionError, requests.exceptions.Timeout, requests.exceptions.ProxyError)):
         return UPSTREAM_UNREACHABLE_MSG
     if isinstance(err, requests.exceptions.HTTPError):
@@ -85,8 +168,8 @@ def cache_get(mobile: str):
         return None
     return item
 
-def cache_set(mobile: str, current: str, status: str):
-    cache[mobile] = {"ts": time.time(), "current": current, "status": status}
+def cache_set(mobile: str, current: str, status: str, error_code: str | None = None, error_ts: str | None = None):
+    cache[mobile] = {"ts": time.time(), "current": current, "status": status, "error_code": error_code, "error_ts": error_ts}
 
 # -----------------------
 # Progress
@@ -126,9 +209,7 @@ def looks_like_login_page(html: str) -> bool:
 
 def fetch(url: str) -> requests.Response:
     r = _http_get(url)
-    if r.status_code >= 400:
-        app.logger.warning("Outbound GET status=%s path=%s", r.status_code, _url_path(url))
-    r.raise_for_status()
+    _raise_if_http_error(r, "GET", url)
     return r
 
 def get_csrf_from_login_page(html: str):
@@ -167,8 +248,7 @@ def ensure_logged_in(op_id: str | None = None) -> str:
         data=payload,
         headers={"Referer": LOGIN_PAGE_URL},
     )
-    if login_resp.status_code >= 400:
-        app.logger.warning("Outbound POST status=%s path=%s", login_resp.status_code, _url_path(LOGIN_POST_URL))
+    _raise_if_http_error(login_resp, "POST", LOGIN_POST_URL)
 
     progress_set(op_id, "Login submitted. Loading overview...")
     ov2 = fetch(OVERVIEW_URL)
@@ -254,9 +334,7 @@ def submit_limit_form(mobile: str, value: str, op_id: str | None = None):
         data=payload,
         headers={"Referer": OVERVIEW_URL},
     )
-    if resp.status_code >= 400:
-        app.logger.warning("Outbound POST status=%s path=%s", resp.status_code, _url_path(post_url))
-    resp.raise_for_status()
+    _raise_if_http_error(resp, "POST", post_url)
     cache.pop(mobile, None)
 
 def wait_until_done(mobile: str, op_id: str | None = None):
@@ -490,6 +568,29 @@ def get_next_scheduled_change(mcfg: dict, tzname: str):
 def healthz():
     return jsonify({"ok": True}), 200
 
+@app.get("/health/upstream")
+def health_upstream():
+    target = "https://my.aldimobile.com.au"
+    try:
+        r = _http_head(target, timeout=5)
+        if r.status_code >= 400:
+            _raise_if_http_error(r, "HEAD", target)
+        return jsonify({"ok": True, "stage": "HEAD", "error_code": None}), 200
+    except UpstreamError as e:
+        if e.error_code.startswith("HTTP_"):
+            return jsonify({"ok": False, "stage": e.stage, "error_code": e.error_code}), 503
+        try:
+            r2 = _http_get(target, timeout=5)
+            if r2.status_code >= 400:
+                _raise_if_http_error(r2, "GET", target)
+            return jsonify({"ok": True, "stage": "GET", "error_code": None}), 200
+        except UpstreamError as e2:
+            app.logger.warning("Upstream health failed stage=%s code=%s", e2.stage, e2.error_code)
+            return jsonify({"ok": False, "stage": e2.stage, "error_code": e2.error_code}), 503
+    except Exception:
+        app.logger.exception("Unexpected upstream health failure")
+        return jsonify({"ok": False, "stage": "health_upstream", "error_code": "UNKNOWN"}), 503
+
 @app.route("/")
 def home():
     cfg = load_cfg()
@@ -500,12 +601,20 @@ def home():
         mcfg = cfg["mobiles"].get(m, {})
         enabled = bool(mcfg.get("enabled", False))
         next_change = get_next_scheduled_change(mcfg, tzname)
+        error_code = None
+        error_ts = None
         try:
             cur, st = get_limit_text_and_status(m, op_id=None)
+            cached = cache_get(m)
+            if cached and cached.get("status") == "Error":
+                error_code = cached.get("error_code")
+                error_ts = cached.get("error_ts")
         except Exception as e:
             app.logger.exception("Failed to load current status for mobile=%s", m)
             cur, st = f"Error: {public_error_message(e)}", "Error"
-        item = {"mobile": m, "enabled": enabled, "current": cur, "status": st}
+            error_code = _error_code_from_exception(e)
+            error_ts = _error_timestamp()
+        item = {"mobile": m, "enabled": enabled, "current": cur, "status": st, "error_code": error_code, "error_ts": error_ts}
         if next_change:
             item.update(next_change)
         items.append(item)
@@ -529,7 +638,7 @@ input,button{width:100%;padding:10px;font-size:14px;border-radius:10px;border:1p
 button{background:#f3f3f3;cursor:pointer}
 a{color:#1a5cff;text-decoration:none}
 
-.spinner-overlay{position:fixed;top:0;left:0;width:100%;height:100%;background:rgba(255,255,255,0.75);display:none;justify-content:center;align-items:center;z-index:9999}
+.spinner-overlay{position:fixed;top:0;left:0;width:100%;height:100%;background:rgba(255,255,255,0.75);display:flex;justify-content:center;align-items:center;z-index:9999}
 .spinner{border:6px solid #f3f3f3;border-top:6px solid #3498db;border-radius:50%;width:50px;height:50px;animation:spin 1s linear infinite}
 @keyframes spin{0%{transform:rotate(0deg)}100%{transform:rotate(360deg)}}
 </style>
@@ -539,14 +648,9 @@ a{color:#1a5cff;text-decoration:none}
 <div id="spinnerOverlay" class="spinner-overlay">
   <div style="display:flex;flex-direction:column;align-items:center;gap:12px;">
     <div class="spinner"></div>
-    <div id="progressText" style="font-size:14px;color:#333;text-align:center;max-width:320px;">Working...</div>
+    <div id="progressText" style="font-size:14px;color:#333;text-align:center;max-width:320px;">Loading...</div>
   </div>
 </div>
-
-<script>
-document.getElementById("spinnerOverlay").style.display = "flex";
-document.getElementById("progressText").innerText = "Loading...";
-</script>
 
 <h2 style="display:flex;align-items:center;gap:10px;margin:0 0 12px 0;">
   <svg width="26" height="26" viewBox="0 0 24 24" fill="none" aria-hidden="true">
@@ -584,6 +688,12 @@ document.getElementById("progressText").innerText = "Loading...";
     {% endif %}
   </div>
   <div style="margin-top:6px;">Current: <span>{{it.current}}</span></div>
+  {% if it.error_code %}
+  <details style="margin-top:6px;">
+    <summary style="cursor:pointer;color:#666;">Details</summary>
+    <div class="small">Code: {{it.error_code}}{% if it.error_ts %} · {{it.error_ts}}{% endif %}</div>
+  </details>
+  {% endif %}
 
   <form style="margin-top:10px;" onsubmit="return startUpdate(event, '{{it.mobile}}')">
     <input name="value" placeholder="Manual Update (GB) e.g. 0, 20, 999" required>
@@ -602,8 +712,10 @@ function setProgress(msg){
 }
 function hideOverlay(){ document.getElementById("spinnerOverlay").style.display="none"; }
 
-window.addEventListener("load", function(){ hideOverlay(); });
-window.addEventListener("pageshow", function(){ hideOverlay(); });
+window.addEventListener("load", () => hideOverlay());
+window.addEventListener("pageshow", (e) => {
+  if (e.persisted) hideOverlay();
+});
 
 function navMessageForHref(href){
   const low = (href || "").toLowerCase();
@@ -911,12 +1023,13 @@ def api_refresh_start():
                 except Exception as e:
                     app.logger.exception("Refresh failed for mobile=%s", m)
                     msg = public_error_message(e)
-                    if msg == UPSTREAM_UNREACHABLE_MSG:
+                    code = _error_code_from_exception(e)
+                    if code in {"OUTBOUND_CONNECT_FAIL", "DNS_FAIL", "OUTBOUND_TIMEOUT", "TLS_FAIL"}:
                         had_upstream_error = True
-                    cache_set(m, f"Error: {msg}", "Error")
+                    cache_set(m, f"Error: {msg}", "Error", error_code=code, error_ts=_error_timestamp())
 
             if had_upstream_error:
-                progress_done(op_id, False, {"error": f"{UPSTREAM_UNREACHABLE_MSG}. Refresh could not contact upstream."})
+                progress_done(op_id, False, {"error": f"{UPSTREAM_UNREACHABLE_MSG} Refresh could not contact upstream."})
             else:
                 progress_done(op_id, True, {"refreshed": True})
         except Exception as e:
