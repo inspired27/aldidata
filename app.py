@@ -180,7 +180,7 @@ PROGRESS_LOCK = threading.Lock()
 def progress_init(msg="Starting...") -> str:
     op_id = uuid.uuid4().hex
     with PROGRESS_LOCK:
-        PROGRESS[op_id] = {"msg": msg, "done": False, "ok": False, "result": None, "ts": time.time()}
+        PROGRESS[op_id] = {"msg": msg, "done": False, "ok": True, "result": None, "ts": time.time()}
     return op_id
 
 def progress_set(op_id: str | None, msg: str):
@@ -201,6 +201,10 @@ def progress_done(op_id: str | None, ok: bool, result=None):
             PROGRESS[op_id]["result"] = result
             PROGRESS[op_id]["ts"] = time.time()
 
+def progress_complete(op_id: str | None, result=None):
+    progress_set(op_id, "Complete")
+    progress_done(op_id, True, result)
+
 # -----------------------
 # Login helpers
 # -----------------------
@@ -218,10 +222,10 @@ def get_csrf_from_login_page(html: str):
     return csrf.get("value") if csrf else None
 
 def ensure_logged_in(op_id: str | None = None) -> str:
-    progress_set(op_id, "Navigating to Shared Data Overview...")
+    progress_set(op_id, "Authenticating...")
     ov = fetch(OVERVIEW_URL)
     if not looks_like_login_page(ov.text):
-        progress_set(op_id, "Already logged in.")
+        progress_set(op_id, "Authenticated")
         return ov.text
 
     progress_set(op_id, "Opening login page...")
@@ -236,7 +240,7 @@ def ensure_logged_in(op_id: str | None = None) -> str:
     if not ALDI_USERNAME or not ALDI_PASSWORD:
         raise Exception("Missing ALDI_USERNAME or ALDI_PASSWORD env vars.")
 
-    progress_set(op_id, "Logging into ALDI Mobile...")
+    progress_set(op_id, "Authenticating...")
     payload = {
         "login_user[login]": ALDI_USERNAME,
         "login_user[password]": ALDI_PASSWORD,
@@ -250,7 +254,7 @@ def ensure_logged_in(op_id: str | None = None) -> str:
     )
     _raise_if_http_error(login_resp, "POST", LOGIN_POST_URL)
 
-    progress_set(op_id, "Login submitted. Loading overview...")
+    progress_set(op_id, "Authenticated")
     ov2 = fetch(OVERVIEW_URL)
     if looks_like_login_page(ov2.text):
         raise Exception("Login failed.")
@@ -282,10 +286,10 @@ def get_limit_text_and_status(mobile: str, op_id: str | None = None):
     cfg = load_cfg()
     tzname = cfg.get("timezone", "Australia/Brisbane")
 
-    progress_set(op_id, f"Loading usage limit for {mobile}...")
+    progress_set(op_id, "Retrieving usage data...")
     html = ensure_logged_in(op_id=op_id)
 
-    progress_set(op_id, f"Finding {mobile} in family plan...")
+    progress_set(op_id, "Retrieving usage data...")
     panel = get_panel_for_mobile(html, mobile)
 
     div = panel.find("div", id=lambda x: x and x.startswith("usageLimitDivconsumerUsageLimit"))
@@ -293,6 +297,7 @@ def get_limit_text_and_status(mobile: str, op_id: str | None = None):
     status = status_from_text(current, tzname)
 
     cache_set(mobile, current, status)
+    progress_set(op_id, "Complete")
     return current, status
 
 # -----------------------
@@ -644,11 +649,7 @@ a{color:#1a5cff;text-decoration:none}
 </style>
 </head>
 <body>
-<!-- BUILD_ID: SPINNER_FIX_001 -->
-
-<div style="position:fixed;top:8px;right:8px;z-index:100000;background:#111;color:#fff;font-size:11px;padding:4px 8px;border-radius:999px;font-family:monospace;">SPINNER_FIX_001</div>
-
-<div id="spinnerOverlay" class="spinner-overlay" style="display:flex;position:fixed;inset:0;z-index:99999;background:rgba(255,0,0,0.15);">
+<div id="spinnerOverlay" class="spinner-overlay" style="display:flex;position:fixed;inset:0;z-index:99999;background:rgba(255,255,255,0.85);">
   <div style="display:flex;flex-direction:column;align-items:center;gap:12px;">
     <div class="spinner"></div>
     <div id="progressText" style="font-size:14px;color:#333;text-align:center;max-width:320px;">Loading...</div>
@@ -753,7 +754,7 @@ document.addEventListener("submit", function(ev){
   showOverlay("Working...");
 }, true);
 
-async function pollProgress(opId){
+async function pollProgress(opId, onDone){
   const poll = async () => {
     try{
       const pr = await fetch(`/api/progress/${opId}`, {cache:"no-store"});
@@ -765,7 +766,11 @@ async function pollProgress(opId){
           alert((pj.result && pj.result.error) ? pj.result.error : "Operation failed");
           return;
         }
-        window.location.reload();
+        if(typeof onDone === "function"){
+          onDone(pj.result || {});
+        }else{
+          window.location.reload();
+        }
         return;
       }
     }catch(e){}
@@ -810,26 +815,28 @@ async function refreshNow(){
 async function loadHomeStatus(){
   showOverlay("Loading latest usage...");
   try{
-    const r = await fetch("/api/home-status", {cache:"no-store"});
+    const r = await fetch("/api/home-status-start", {method:"POST"});
     const j = await r.json();
     if(!j.ok) throw new Error(j.error || "Failed to load status");
 
-    for(const it of (j.items || [])){
-      const currentEl = document.getElementById(`current-${it.mobile}`);
-      if(currentEl) currentEl.innerText = it.current || "Unknown";
+    pollProgress(j.op_id, (result) => {
+      for(const it of (result.items || [])){
+        const currentEl = document.getElementById(`current-${it.mobile}`);
+        if(currentEl) currentEl.innerText = it.current || "Unknown";
 
-      const detailsText = document.getElementById(`details-${it.mobile}`);
-      const detailsBox = document.getElementById(`error-box-${it.mobile}`);
-      if(it.error_code){
-        if(detailsText) detailsText.innerText = `Code: ${it.error_code}${it.error_ts ? ` · ${it.error_ts}` : ""}`;
-        if(detailsBox) detailsBox.style.display = "block";
-      }else if(detailsBox){
-        detailsBox.style.display = "none";
+        const detailsText = document.getElementById(`details-${it.mobile}`);
+        const detailsBox = document.getElementById(`error-box-${it.mobile}`);
+        if(it.error_code){
+          if(detailsText) detailsText.innerText = `Code: ${it.error_code}${it.error_ts ? ` · ${it.error_ts}` : ""}`;
+          if(detailsBox) detailsBox.style.display = "block";
+        }else if(detailsBox){
+          detailsBox.style.display = "none";
+        }
       }
-    }
+      hideOverlay();
+    });
   }catch(e){
     console.error(e);
-  }finally{
     hideOverlay();
   }
 }
@@ -1042,6 +1049,40 @@ def api_home_status():
     app.logger.warning("[api_home_status] completed in %.3fs", time.perf_counter() - start)
     return jsonify({"ok": True, "items": out})
 
+@app.post("/api/home-status-start")
+def api_home_status_start():
+    op_id = progress_init("Retrieving usage data...")
+
+    def worker():
+        start = time.perf_counter()
+        app.logger.warning("[api_home_status_start] started")
+        out = []
+        try:
+            for m in MOBILES:
+                error_code = None
+                error_ts = None
+                try:
+                    cur, st = get_limit_text_and_status(m, op_id=op_id)
+                    cached = cache_get(m)
+                    if cached and cached.get("status") == "Error":
+                        error_code = cached.get("error_code")
+                        error_ts = cached.get("error_ts")
+                except Exception as e:
+                    app.logger.exception("Failed to load current status for mobile=%s", m)
+                    cur, st = f"Error: {public_error_message(e)}", "Error"
+                    error_code = _error_code_from_exception(e)
+                    error_ts = _error_timestamp()
+                out.append({"mobile": m, "current": cur, "status": st, "error_code": error_code, "error_ts": error_ts})
+
+            app.logger.warning("[api_home_status_start] completed in %.3fs", time.perf_counter() - start)
+            progress_complete(op_id, {"items": out})
+        except Exception as e:
+            app.logger.exception("Home status operation failed")
+            progress_done(op_id, False, {"error": public_error_message(e)})
+
+    threading.Thread(target=worker, daemon=True).start()
+    return jsonify({"ok": True, "op_id": op_id})
+
 @app.route("/api/progress/<op_id>")
 def api_progress(op_id):
     with PROGRESS_LOCK:
@@ -1060,13 +1101,12 @@ def api_set_now_start():
     if not value:
         return jsonify({"ok": False, "error": "Missing value"}), 400
 
-    op_id = progress_init("Starting manual update...")
+    op_id = progress_init("Authenticating...")
 
     def worker():
         try:
             res = set_limit_and_wait(mobile, value, op_id=op_id)
-            progress_set(op_id, "Done.")
-            progress_done(op_id, True, res)
+            progress_complete(op_id, res)
         except Exception as e:
             app.logger.exception("Manual update failed for mobile=%s", mobile)
             progress_done(op_id, False, {"error": public_error_message(e)})
@@ -1076,13 +1116,13 @@ def api_set_now_start():
 
 @app.route("/api/refresh-start", methods=["POST"])
 def api_refresh_start():
-    op_id = progress_init("Refreshing data...")
+    op_id = progress_init("Authenticating...")
 
     def worker():
         try:
             had_upstream_error = False
             for i, m in enumerate(MOBILES, start=1):
-                progress_set(op_id, f"Refreshing {m} ({i}/{len(MOBILES)})...")
+                progress_set(op_id, f"Retrieving usage data... ({i}/{len(MOBILES)})")
                 try:
                     get_limit_text_and_status(m, op_id=op_id)
                 except Exception as e:
@@ -1096,7 +1136,7 @@ def api_refresh_start():
             if had_upstream_error:
                 progress_done(op_id, False, {"error": f"{UPSTREAM_UNREACHABLE_MSG} Refresh could not contact upstream."})
             else:
-                progress_done(op_id, True, {"refreshed": True})
+                progress_complete(op_id, {"refreshed": True})
         except Exception as e:
             app.logger.exception("Refresh operation failed")
             progress_done(op_id, False, {"error": public_error_message(e)})
