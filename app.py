@@ -593,6 +593,8 @@ def health_upstream():
 
 @app.route("/")
 def home():
+    route_start = time.perf_counter()
+    app.logger.warning("[home] start rendering /")
     cfg = load_cfg()
     tzname = cfg.get("timezone", "Australia/Brisbane")
 
@@ -603,17 +605,15 @@ def home():
         next_change = get_next_scheduled_change(mcfg, tzname)
         error_code = None
         error_ts = None
-        try:
-            cur, st = get_limit_text_and_status(m, op_id=None)
-            cached = cache_get(m)
-            if cached and cached.get("status") == "Error":
+        cached = cache_get(m)
+        if cached:
+            cur = cached.get("current", "Loading...")
+            st = cached.get("status", "Pending")
+            if cached.get("status") == "Error":
                 error_code = cached.get("error_code")
                 error_ts = cached.get("error_ts")
-        except Exception as e:
-            app.logger.exception("Failed to load current status for mobile=%s", m)
-            cur, st = f"Error: {public_error_message(e)}", "Error"
-            error_code = _error_code_from_exception(e)
-            error_ts = _error_timestamp()
+        else:
+            cur, st = "Loading...", "Pending"
         item = {"mobile": m, "enabled": enabled, "current": cur, "status": st, "error_code": error_code, "error_ts": error_ts}
         if next_change:
             item.update(next_change)
@@ -638,14 +638,17 @@ input,button{width:100%;padding:10px;font-size:14px;border-radius:10px;border:1p
 button{background:#f3f3f3;cursor:pointer}
 a{color:#1a5cff;text-decoration:none}
 
-.spinner-overlay{position:fixed;top:0;left:0;width:100%;height:100%;background:rgba(255,255,255,0.75);display:flex;justify-content:center;align-items:center;z-index:9999}
+.spinner-overlay{display:flex;justify-content:center;align-items:center}
 .spinner{border:6px solid #f3f3f3;border-top:6px solid #3498db;border-radius:50%;width:50px;height:50px;animation:spin 1s linear infinite}
 @keyframes spin{0%{transform:rotate(0deg)}100%{transform:rotate(360deg)}}
 </style>
 </head>
 <body>
+<!-- BUILD_ID: SPINNER_FIX_001 -->
 
-<div id="spinnerOverlay" class="spinner-overlay" style="display:flex;">
+<div style="position:fixed;top:8px;right:8px;z-index:100000;background:#111;color:#fff;font-size:11px;padding:4px 8px;border-radius:999px;font-family:monospace;">SPINNER_FIX_001</div>
+
+<div id="spinnerOverlay" class="spinner-overlay" style="display:flex;position:fixed;inset:0;z-index:99999;background:rgba(255,0,0,0.15);">
   <div style="display:flex;flex-direction:column;align-items:center;gap:12px;">
     <div class="spinner"></div>
     <div id="progressText" style="font-size:14px;color:#333;text-align:center;max-width:320px;">Loading...</div>
@@ -687,11 +690,16 @@ a{color:#1a5cff;text-decoration:none}
       <span class="pill pending">Next: {{it.next_change_label}} &rarr; {{it.next_change_gb}} GB</span>
     {% endif %}
   </div>
-  <div style="margin-top:6px;">Current: <span>{{it.current}}</span></div>
+  <div style="margin-top:6px;">Current: <span id="current-{{it.mobile}}">{{it.current}}</span></div>
   {% if it.error_code %}
-  <details style="margin-top:6px;">
+  <details id="error-box-{{it.mobile}}" style="margin-top:6px;">
     <summary style="cursor:pointer;color:#666;">Details</summary>
-    <div class="small">Code: {{it.error_code}}{% if it.error_ts %} · {{it.error_ts}}{% endif %}</div>
+    <div id="details-{{it.mobile}}" class="small">Code: {{it.error_code}}{% if it.error_ts %} · {{it.error_ts}}{% endif %}</div>
+  </details>
+  {% else %}
+  <details id="error-box-{{it.mobile}}" style="margin-top:6px;display:none;">
+    <summary style="cursor:pointer;color:#666;">Details</summary>
+    <div id="details-{{it.mobile}}" class="small"></div>
   </details>
   {% endif %}
 
@@ -798,10 +806,41 @@ async function refreshNow(){
   }
   pollProgress(j.op_id);
 }
+
+async function loadHomeStatus(){
+  showOverlay("Loading latest usage...");
+  try{
+    const r = await fetch("/api/home-status", {cache:"no-store"});
+    const j = await r.json();
+    if(!j.ok) throw new Error(j.error || "Failed to load status");
+
+    for(const it of (j.items || [])){
+      const currentEl = document.getElementById(`current-${it.mobile}`);
+      if(currentEl) currentEl.innerText = it.current || "Unknown";
+
+      const detailsText = document.getElementById(`details-${it.mobile}`);
+      const detailsBox = document.getElementById(`error-box-${it.mobile}`);
+      if(it.error_code){
+        if(detailsText) detailsText.innerText = `Code: ${it.error_code}${it.error_ts ? ` · ${it.error_ts}` : ""}`;
+        if(detailsBox) detailsBox.style.display = "block";
+      }else if(detailsBox){
+        detailsBox.style.display = "none";
+      }
+    }
+  }catch(e){
+    console.error(e);
+  }finally{
+    hideOverlay();
+  }
+}
+
+window.addEventListener("load", () => {
+  hideOverlay();
+  loadHomeStatus();
+});
 </script>
 
 <script>
-window.addEventListener("load", () => hideOverlay());
 window.addEventListener("pageshow", (e) => { if (e.persisted) hideOverlay(); });
 </script>
 
@@ -975,7 +1014,33 @@ window.copyDefaultsAndSave = async function(mobile){
 </body>
 </html>
 """
-    return render_template_string(page, items=items)
+    rendered = render_template_string(page, items=items)
+    app.logger.warning("[home] rendered / in %.3fs", time.perf_counter() - route_start)
+    return rendered
+
+
+@app.get("/api/home-status")
+def api_home_status():
+    start = time.perf_counter()
+    app.logger.warning("[api_home_status] started")
+    out = []
+    for m in MOBILES:
+        error_code = None
+        error_ts = None
+        try:
+            cur, st = get_limit_text_and_status(m, op_id=None)
+            cached = cache_get(m)
+            if cached and cached.get("status") == "Error":
+                error_code = cached.get("error_code")
+                error_ts = cached.get("error_ts")
+        except Exception as e:
+            app.logger.exception("Failed to load current status for mobile=%s", m)
+            cur, st = f"Error: {public_error_message(e)}", "Error"
+            error_code = _error_code_from_exception(e)
+            error_ts = _error_timestamp()
+        out.append({"mobile": m, "current": cur, "status": st, "error_code": error_code, "error_ts": error_ts})
+    app.logger.warning("[api_home_status] completed in %.3fs", time.perf_counter() - start)
+    return jsonify({"ok": True, "items": out})
 
 @app.route("/api/progress/<op_id>")
 def api_progress(op_id):
