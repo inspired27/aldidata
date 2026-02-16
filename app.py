@@ -26,6 +26,7 @@ POLL_TIMEOUT_SECONDS = 45
 CACHE_TTL_SECONDS = 5
 OUTBOUND_PROXY_URL = os.getenv("OUTBOUND_PROXY_URL", "").strip()
 UPSTREAM_UNREACHABLE_MSG = "Cannot connect to ALDI Mobile (network/DNS)."
+PROGRESS_DEBUG_DELAY_MS = max(0, int(os.getenv("PROGRESS_DEBUG_DELAY_MS", "0") or "0"))
 
 app = Flask(__name__)
 
@@ -180,16 +181,31 @@ PROGRESS_LOCK = threading.Lock()
 def progress_init(msg="Starting...") -> str:
     op_id = uuid.uuid4().hex
     with PROGRESS_LOCK:
-        PROGRESS[op_id] = {"msg": msg, "done": False, "ok": True, "result": None, "ts": time.time()}
+        PROGRESS[op_id] = {
+            "msg": msg,
+            "last_msg": msg,
+            "seq": 1,
+            "done": False,
+            "ok": True,
+            "result": None,
+            "ts": time.time(),
+        }
+    app.logger.info("progress_set op_id=%s seq=%s msg=%s", op_id, 1, msg)
     return op_id
 
 def progress_set(op_id: str | None, msg: str):
     if not op_id:
         return
+    new_seq = None
     with PROGRESS_LOCK:
         if op_id in PROGRESS:
             PROGRESS[op_id]["msg"] = msg
+            PROGRESS[op_id]["last_msg"] = msg
+            PROGRESS[op_id]["seq"] = int(PROGRESS[op_id].get("seq", 0)) + 1
             PROGRESS[op_id]["ts"] = time.time()
+            new_seq = PROGRESS[op_id]["seq"]
+    if new_seq is not None:
+        app.logger.info("progress_set op_id=%s seq=%s msg=%s", op_id, new_seq, msg)
 
 def progress_done(op_id: str | None, ok: bool, result=None):
     if not op_id:
@@ -204,6 +220,10 @@ def progress_done(op_id: str | None, ok: bool, result=None):
 def progress_complete(op_id: str | None, result=None):
     progress_set(op_id, "Complete")
     progress_done(op_id, True, result)
+
+def maybe_progress_debug_delay():
+    if PROGRESS_DEBUG_DELAY_MS > 0:
+        time.sleep(PROGRESS_DEBUG_DELAY_MS / 1000.0)
 
 # -----------------------
 # Login helpers
@@ -226,6 +246,7 @@ def ensure_logged_in(op_id: str | None = None) -> str:
     ov = fetch(OVERVIEW_URL)
     if not looks_like_login_page(ov.text):
         progress_set(op_id, "Authenticated")
+        maybe_progress_debug_delay()
         return ov.text
 
     progress_set(op_id, "Opening login page...")
@@ -255,6 +276,7 @@ def ensure_logged_in(op_id: str | None = None) -> str:
     _raise_if_http_error(login_resp, "POST", LOGIN_POST_URL)
 
     progress_set(op_id, "Authenticated")
+    maybe_progress_debug_delay()
     ov2 = fetch(OVERVIEW_URL)
     if looks_like_login_page(ov2.text):
         raise Exception("Login failed.")
@@ -287,6 +309,7 @@ def get_limit_text_and_status(mobile: str, op_id: str | None = None):
     tzname = cfg.get("timezone", "Australia/Brisbane")
 
     progress_set(op_id, "Retrieving usage data...")
+    maybe_progress_debug_delay()
     html = ensure_logged_in(op_id=op_id)
 
     progress_set(op_id, "Retrieving usage data...")
@@ -721,6 +744,8 @@ function setProgress(msg){
 }
 function hideOverlay(){ document.getElementById("spinnerOverlay").style.display="none"; }
 
+let activeOpId = null;
+
 function navMessageForHref(href){
   const low = (href || "").toLowerCase();
   if(low.includes("login")) return "Logging in...";
@@ -755,12 +780,22 @@ document.addEventListener("submit", function(ev){
 }, true);
 
 async function pollProgress(opId, onDone){
+  activeOpId = opId;
+  let lastSeq = 0;
+  let lastMsg = "";
   const poll = async () => {
     try{
       const pr = await fetch(`/api/progress/${opId}`, {cache:"no-store"});
       const pj = await pr.json();
-      setProgress(pj.msg || "Working...");
+      const seq = Number(pj.seq || 0);
+      const msg = pj.msg || "Working...";
+      if(seq > lastSeq || msg !== lastMsg){
+        setProgress(msg);
+        lastSeq = seq;
+        lastMsg = msg;
+      }
       if(pj.done){
+        activeOpId = null;
         if(!pj.ok){
           hideOverlay();
           alert((pj.result && pj.result.error) ? pj.result.error : "Operation failed");
@@ -842,13 +877,14 @@ async function loadHomeStatus(){
 }
 
 window.addEventListener("load", () => {
-  hideOverlay();
   loadHomeStatus();
 });
 </script>
 
 <script>
-window.addEventListener("pageshow", (e) => { if (e.persisted) hideOverlay(); });
+window.addEventListener("pageshow", (e) => {
+  if (e.persisted && !activeOpId) hideOverlay();
+});
 </script>
 
 
@@ -1088,8 +1124,8 @@ def api_progress(op_id):
     with PROGRESS_LOCK:
         st = PROGRESS.get(op_id)
     if not st:
-        return jsonify({"ok": False, "done": True, "msg": "Unknown operation", "result": {"error": "Unknown operation"}})
-    return jsonify({"ok": st["ok"], "done": st["done"], "msg": st["msg"], "result": st["result"]})
+        return jsonify({"ok": False, "done": True, "msg": "Unknown operation", "seq": 0, "result": {"error": "Unknown operation"}})
+    return jsonify({"ok": st["ok"], "done": st["done"], "msg": st["msg"], "seq": st.get("seq", 0), "result": st["result"]})
 
 @app.route("/api/set-now-start", methods=["POST"])
 def api_set_now_start():
