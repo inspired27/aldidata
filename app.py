@@ -5,6 +5,7 @@ from bs4 import BeautifulSoup
 from urllib.parse import urljoin, urlparse
 import time, json, os
 from datetime import datetime, timedelta, timezone
+import re
 import uuid, threading
 
 from apscheduler.schedulers.background import BackgroundScheduler
@@ -316,7 +317,26 @@ def get_limit_text_and_status(mobile: str, op_id: str | None = None):
     panel = get_panel_for_mobile(html, mobile)
 
     div = panel.find("div", id=lambda x: x and x.startswith("usageLimitDivconsumerUsageLimit"))
-    current = div.get_text(" ", strip=True) if div else "Unknown"
+    limit_text = div.get_text(" ", strip=True) if div else ""
+
+    usage_text = ""
+    usage_div = panel.find("div", id=lambda x: x and x.startswith("usageDivconsumerUsage"))
+    if usage_div:
+        usage_text = usage_div.get_text(" ", strip=True)
+
+    if not usage_text:
+        panel_text = " ".join(panel.get_text("\n", strip=True).split())
+        m = re.search(r"((?:usage|used|remaining|left)[^\n]*?\d+(?:\.\d+)?\s*(?:GB|MB)|\d+(?:\.\d+)?\s*(?:GB|MB)[^\n]*?(?:used|remaining|left))", panel_text, flags=re.IGNORECASE)
+        if m:
+            usage_text = m.group(1).strip()
+
+    if usage_text and limit_text:
+        current = f"{usage_text} · Set: {limit_text}"
+    elif usage_text:
+        current = usage_text
+    else:
+        current = limit_text or "Unknown"
+
     status = status_from_text(current, tzname)
 
     cache_set(mobile, current, status)
