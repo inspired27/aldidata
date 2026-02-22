@@ -1,38 +1,153 @@
 # -*- coding: utf-8 -*-
+from __future__ import annotations
+
 from flask import Flask, render_template_string, request, redirect, url_for, jsonify
 import requests
 from bs4 import BeautifulSoup
 from urllib.parse import urljoin, urlparse
-import time, json, os
+import time, json, os, uuid, threading, re
 from datetime import datetime, timedelta, timezone
-import re
-import uuid, threading
+from concurrent.futures import ThreadPoolExecutor, as_completed
+import fcntl
 
 from apscheduler.schedulers.background import BackgroundScheduler
 from apscheduler.triggers.cron import CronTrigger
 import pytz
 
-ALDI_USERNAME = os.getenv("ALDI_USERNAME", "0415100346")
-ALDI_PASSWORD = os.getenv("ALDI_PASSWORD", "PssAldiMy123!")
+# ============================================================
+# CONFIG
+# ============================================================
+ALDI_USERNAME = os.getenv("ALDI_USERNAME", "").strip()
+ALDI_PASSWORD = os.getenv("ALDI_PASSWORD", "").strip()
 
-OVERVIEW_URL   = "https://my.aldimobile.com.au/admin/s/5620272/shareddataoverview"
+OVERVIEW_URL = "https://my.aldimobile.com.au/admin/s/5620272/shareddataoverview"
 LOGIN_PAGE_URL = "https://my.aldimobile.com.au/login/"
 LOGIN_POST_URL = "https://my.aldimobile.com.au/login_check"
+BALANCE_URL_TMPL = "https://my.aldimobile.com.au/admin/s/{mobile}/shareddataajax/balance"
 
-MOBILES = ["0494584269","0466008129", "0466008170",]
+# Your mobiles (4)
+MOBILES = [
+    "0466008129",
+    "0466008170",
+    "0494584269",
+    "0415100346",
+]
+
+# Friendly labels (prefix)
+MOBILE_LABELS = {
+    "0415100346": "Pablo",
+    "0466008129": "Josh",
+    "0466008170": "Sam",
+    "0494584269": "Spare",
+}
+
 CONFIG_PATH = os.path.join(os.path.dirname(__file__), "schedule_matrix.json")
 
+# Cache / performance
+CACHE_TTL_SECONDS = 20
+LIMIT_CACHE_TTL_SECONDS = 1800
+SESSION_OK_TTL_SECONDS = 900
+BALANCE_WORKERS = 6
+
+# Manual update polling
 POLL_INTERVAL_SECONDS = 2
 POLL_TIMEOUT_SECONDS = 45
-CACHE_TTL_SECONDS = 5
-OUTBOUND_PROXY_URL = os.getenv("OUTBOUND_PROXY_URL", "").strip()
+
+# Progress shared across gunicorn workers
+PROGRESS_PATH = os.getenv("PROGRESS_PATH", "/tmp/aldiapp_progress.json")
+
+# Only one scheduler instance across gunicorn workers
+SCHED_LOCK_PATH = os.getenv("SCHED_LOCK_PATH", "/tmp/aldiapp_scheduler.lock")
+
 UPSTREAM_UNREACHABLE_MSG = "Cannot connect to ALDI Mobile (network/DNS)."
-PROGRESS_DEBUG_DELAY_MS = max(0, int(os.getenv("PROGRESS_DEBUG_DELAY_MS", "0") or "0"))
 
 app = Flask(__name__)
 
-_SESSION = None
+# ============================================================
+# SHARED STATE
+# ============================================================
+_SESSION: requests.Session | None = None
+_LAST_LOGIN_OK_TS = 0.0
 
+cache: dict[str, dict] = {}
+_LIMIT_CACHE = {"ts": 0.0, "limits": {}}
+_CACHE_LOCK = threading.Lock()
+
+scheduler: BackgroundScheduler | None = None
+_sched_lock_fd = None
+
+
+# ============================================================
+# UTIL
+# ============================================================
+def display_name(mobile: str) -> str:
+    lbl = MOBILE_LABELS.get(mobile)
+    return f"{lbl} \u2013 {mobile}" if lbl else mobile
+
+
+def now_ts_str(tzname: str) -> str:
+    try:
+        tz = pytz.timezone(tzname)
+    except Exception:
+        tz = pytz.timezone("Australia/Brisbane")
+    return datetime.now(tz).strftime("%a %d %b %H:%M")
+
+
+def server_utc_str() -> str:
+    return datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S UTC")
+
+
+def _error_timestamp() -> str:
+    return datetime.now(timezone.utc).isoformat(timespec="seconds")
+
+
+def _url_path(url: str) -> str:
+    try:
+        return urlparse(url).path or "/"
+    except Exception:
+        return "<unknown>"
+
+
+def _mb_to_gb(mb_str: str | int | float | None) -> float:
+    try:
+        mb = float(str(mb_str).strip())
+        return mb / 1024.0
+    except Exception:
+        return 0.0
+
+
+def _fmt_gb(v: float | None) -> str:
+    if v is None:
+        return "—"
+    try:
+        return f"{float(v):.2f}GB"
+    except Exception:
+        return "—"
+
+
+def _parse_float_from_text(s: str) -> float | None:
+    s = (s or "").strip()
+    m = re.search(r"(\d+(?:\.\d+)?)", s)
+    if not m:
+        return None
+    try:
+        return float(m.group(1))
+    except Exception:
+        return None
+
+
+def _status_class(status: str) -> str:
+    s = (status or "").strip()
+    if s == "Error":
+        return "err"
+    if s in {"Pending", "Loading..."}:
+        return "pending"
+    return "ok"
+
+
+# ============================================================
+# SESSION + HTTP
+# ============================================================
 class UpstreamError(Exception):
     def __init__(self, error_code: str, user_message: str, stage: str = "", *, http_status: int | None = None):
         super().__init__(user_message)
@@ -41,25 +156,12 @@ class UpstreamError(Exception):
         self.stage = stage
         self.http_status = http_status
 
-def _http_error_code(status_code: int) -> str:
-    if status_code == 403:
-        return "HTTP_403"
-    if 500 <= status_code <= 599:
-        return "HTTP_5XX"
-    return f"HTTP_{status_code}"
-
-def _http_error_message(status_code: int) -> str:
-    if status_code == 403:
-        return "ALDI Mobile refused access (HTTP 403)."
-    if 500 <= status_code <= 599:
-        return "ALDI Mobile is unavailable (HTTP 5xx)."
-    return f"ALDI Mobile request failed (HTTP {status_code})."
 
 def _classify_request_exception(err: Exception) -> tuple[str, str]:
     if isinstance(err, requests.exceptions.SSLError):
         return "TLS_FAIL", "Cannot establish a secure connection to ALDI Mobile (TLS)."
     if isinstance(err, requests.exceptions.Timeout):
-        return "OUTBOUND_TIMEOUT", "Cannot connect to ALDI Mobile (network/DNS)."
+        return "OUTBOUND_TIMEOUT", UPSTREAM_UNREACHABLE_MSG
     if isinstance(err, requests.exceptions.ConnectionError):
         low = str(err).lower()
         dns_markers = [
@@ -71,38 +173,47 @@ def _classify_request_exception(err: Exception) -> tuple[str, str]:
             "failed to resolve",
         ]
         if any(m in low for m in dns_markers):
-            return "DNS_FAIL", "Cannot connect to ALDI Mobile (network/DNS)."
-        return "OUTBOUND_CONNECT_FAIL", "Cannot connect to ALDI Mobile (network/DNS)."
+            return "DNS_FAIL", UPSTREAM_UNREACHABLE_MSG
+        return "OUTBOUND_CONNECT_FAIL", UPSTREAM_UNREACHABLE_MSG
     return "OUTBOUND_REQUEST_FAIL", "ALDI Mobile request failed."
 
-def _error_code_from_exception(err: Exception) -> str:
-    if isinstance(err, UpstreamError):
-        return err.error_code
-    code, _ = _classify_request_exception(err)
-    return code
 
-def _error_timestamp() -> str:
-    return datetime.now(timezone.utc).isoformat(timespec="seconds")
+def _http_error_code(status_code: int) -> str:
+    if status_code == 403:
+        return "HTTP_403"
+    if 500 <= status_code <= 599:
+        return "HTTP_5XX"
+    return f"HTTP_{status_code}"
+
+
+def _http_error_message(status_code: int) -> str:
+    if status_code == 403:
+        return "ALDI Mobile refused access (HTTP 403)."
+    if 500 <= status_code <= 599:
+        return "ALDI Mobile is unavailable (HTTP 5xx)."
+    return f"ALDI Mobile request failed (HTTP {status_code})."
+
+
+def _raise_if_http_error(r: requests.Response, method: str, url: str):
+    if r.status_code >= 400:
+        code = _http_error_code(r.status_code)
+        raise UpstreamError(code, _http_error_message(r.status_code), stage=f"{method} {_url_path(url)}", http_status=r.status_code)
+
 
 def get_session() -> requests.Session:
     global _SESSION
     if _SESSION is None:
-        _SESSION = requests.Session()
-        _SESSION.trust_env = False  # ignore HTTP(S)_PROXY and related environment config
-        if OUTBOUND_PROXY_URL:
-            _SESSION.proxies.update({"http": OUTBOUND_PROXY_URL, "https": OUTBOUND_PROXY_URL})
-            app.logger.info("Using explicit outbound proxy from OUTBOUND_PROXY_URL")
-        _SESSION.headers.update({
-            "User-Agent": "Mozilla/5.0",
-            "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
-        })
+        s = requests.Session()
+        s.trust_env = False
+        s.headers.update(
+            {
+                "User-Agent": "Mozilla/5.0",
+                "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+            }
+        )
+        _SESSION = s
     return _SESSION
 
-def _url_path(url: str) -> str:
-    try:
-        return urlparse(url).path or "/"
-    except Exception:
-        return "<unknown>"
 
 def _http_get(url: str, **kwargs) -> requests.Response:
     try:
@@ -111,9 +222,8 @@ def _http_get(url: str, **kwargs) -> requests.Response:
         return get_session().get(url, **kwargs)
     except requests.RequestException as e:
         code, msg = _classify_request_exception(e)
-        stage = f"GET {_url_path(url)}"
-        app.logger.exception("Outbound GET failed path=%s code=%s exc=%s", _url_path(url), code, e.__class__.__name__)
-        raise UpstreamError(code, msg, stage=stage) from e
+        raise UpstreamError(code, msg, stage=f"GET {_url_path(url)}") from e
+
 
 def _http_post(url: str, **kwargs) -> requests.Response:
     try:
@@ -122,9 +232,8 @@ def _http_post(url: str, **kwargs) -> requests.Response:
         return get_session().post(url, **kwargs)
     except requests.RequestException as e:
         code, msg = _classify_request_exception(e)
-        stage = f"POST {_url_path(url)}"
-        app.logger.exception("Outbound POST failed path=%s code=%s exc=%s", _url_path(url), code, e.__class__.__name__)
-        raise UpstreamError(code, msg, stage=stage) from e
+        raise UpstreamError(code, msg, stage=f"POST {_url_path(url)}") from e
+
 
 def _http_head(url: str, **kwargs) -> requests.Response:
     try:
@@ -133,161 +242,289 @@ def _http_head(url: str, **kwargs) -> requests.Response:
         return get_session().head(url, **kwargs)
     except requests.RequestException as e:
         code, msg = _classify_request_exception(e)
-        stage = f"HEAD {_url_path(url)}"
-        app.logger.exception("Outbound HEAD failed path=%s code=%s exc=%s", _url_path(url), code, e.__class__.__name__)
-        raise UpstreamError(code, msg, stage=stage) from e
+        raise UpstreamError(code, msg, stage=f"HEAD {_url_path(url)}") from e
 
-def _raise_if_http_error(r: requests.Response, method: str, url: str):
-    if r.status_code >= 400:
-        code = _http_error_code(r.status_code)
-        stage = f"{method} {_url_path(url)}"
-        app.logger.warning("Outbound %s status=%s path=%s code=%s", method, r.status_code, _url_path(url), code)
-        raise UpstreamError(code, _http_error_message(r.status_code), stage=stage, http_status=r.status_code)
 
 def public_error_message(err: Exception) -> str:
     if isinstance(err, UpstreamError):
         return err.user_message
     if isinstance(err, (requests.exceptions.ConnectionError, requests.exceptions.Timeout, requests.exceptions.ProxyError)):
         return UPSTREAM_UNREACHABLE_MSG
-    if isinstance(err, requests.exceptions.HTTPError):
-        return "ALDI Mobile request failed"
     return "Operation failed"
 
-cache = {}
 
-def now_ts_str(tzname: str) -> str:
-    try:
-        tz = pytz.timezone(tzname)
-    except Exception:
-        tz = pytz.timezone("Australia/Brisbane")
-    return datetime.now(tz).strftime("%a %d %b %H:%M")
-
-def cache_get(mobile: str):
-    item = cache.get(mobile)
-    if not item:
-        return None
-    if time.time() - item["ts"] > CACHE_TTL_SECONDS:
-        return None
-    return item
-
-def cache_set(mobile: str, current: str, status: str, error_code: str | None = None, error_ts: str | None = None):
-    cache[mobile] = {"ts": time.time(), "current": current, "status": status, "error_code": error_code, "error_ts": error_ts}
-
-# -----------------------
-# Progress
-# -----------------------
-PROGRESS = {}
-PROGRESS_LOCK = threading.Lock()
-
-def progress_init(msg="Starting...") -> str:
-    op_id = uuid.uuid4().hex
-    with PROGRESS_LOCK:
-        PROGRESS[op_id] = {
-            "msg": msg,
-            "last_msg": msg,
-            "seq": 1,
-            "done": False,
-            "ok": True,
-            "result": None,
-            "ts": time.time(),
-        }
-    app.logger.info("progress_set op_id=%s seq=%s msg=%s", op_id, 1, msg)
-    return op_id
-
-def progress_set(op_id: str | None, msg: str):
-    if not op_id:
-        return
-    new_seq = None
-    with PROGRESS_LOCK:
-        if op_id in PROGRESS:
-            PROGRESS[op_id]["msg"] = msg
-            PROGRESS[op_id]["last_msg"] = msg
-            PROGRESS[op_id]["seq"] = int(PROGRESS[op_id].get("seq", 0)) + 1
-            PROGRESS[op_id]["ts"] = time.time()
-            new_seq = PROGRESS[op_id]["seq"]
-    if new_seq is not None:
-        app.logger.info("progress_set op_id=%s seq=%s msg=%s", op_id, new_seq, msg)
-
-def progress_done(op_id: str | None, ok: bool, result=None):
-    if not op_id:
-        return
-    with PROGRESS_LOCK:
-        if op_id in PROGRESS:
-            PROGRESS[op_id]["done"] = True
-            PROGRESS[op_id]["ok"] = ok
-            PROGRESS[op_id]["result"] = result
-            PROGRESS[op_id]["ts"] = time.time()
-
-def progress_complete(op_id: str | None, result=None):
-    progress_set(op_id, "Complete")
-    progress_done(op_id, True, result)
-
-def maybe_progress_debug_delay():
-    if PROGRESS_DEBUG_DELAY_MS > 0:
-        time.sleep(PROGRESS_DEBUG_DELAY_MS / 1000.0)
-
-# -----------------------
-# Login helpers
-# -----------------------
 def looks_like_login_page(html: str) -> bool:
-    return "login_password" in (html or "").lower()
+    low = (html or "").lower()
+    return ("login_password" in low) or ("login_check" in low and "csrf" in low)
 
-def fetch(url: str) -> requests.Response:
-    r = _http_get(url)
-    _raise_if_http_error(r, "GET", url)
-    return r
 
-def get_csrf_from_login_page(html: str):
-    soup = BeautifulSoup(html, "html.parser")
+def get_csrf_from_login_page(html: str) -> str | None:
+    soup = BeautifulSoup(html or "", "html.parser")
     csrf = soup.find("input", attrs={"name": "_csrf_token"})
     return csrf.get("value") if csrf else None
 
-def ensure_logged_in(op_id: str | None = None) -> str:
-    progress_set(op_id, "Authenticating...")
-    ov = fetch(OVERVIEW_URL)
-    if not looks_like_login_page(ov.text):
-        progress_set(op_id, "Authenticated")
-        maybe_progress_debug_delay()
-        return ov.text
 
-    progress_set(op_id, "Opening login page...")
-    lp = fetch(LOGIN_PAGE_URL)
+def ensure_logged_in(progress_op_id: str | None = None):
+    global _LAST_LOGIN_OK_TS
+    if (time.time() - _LAST_LOGIN_OK_TS) < SESSION_OK_TTL_SECONDS:
+        return
+
+    progress_set(progress_op_id, "Authenticating...")
+
+    ov = _http_get(OVERVIEW_URL)
+    _raise_if_http_error(ov, "GET", OVERVIEW_URL)
+    if not looks_like_login_page(ov.text):
+        _LAST_LOGIN_OK_TS = time.time()
+        progress_set(progress_op_id, "Authenticated")
+        return
+
+    progress_set(progress_op_id, "Opening login page...")
+    lp = _http_get(LOGIN_PAGE_URL)
+    _raise_if_http_error(lp, "GET", LOGIN_PAGE_URL)
     csrf = get_csrf_from_login_page(lp.text)
     if not csrf:
-        lp2 = fetch(LOGIN_PAGE_URL)
+        lp2 = _http_get(LOGIN_PAGE_URL)
+        _raise_if_http_error(lp2, "GET", LOGIN_PAGE_URL)
         csrf = get_csrf_from_login_page(lp2.text)
+
     if not csrf:
-        raise Exception("Could not find CSRF token on login page.")
+        raise UpstreamError("LOGIN_CSRF_MISSING", "Could not find CSRF token on login page.", stage="GET /login")
 
     if not ALDI_USERNAME or not ALDI_PASSWORD:
-        raise Exception("Missing ALDI_USERNAME or ALDI_PASSWORD env vars.")
+        raise UpstreamError("MISSING_CREDS", "Missing ALDI_USERNAME or ALDI_PASSWORD env vars.", stage="env")
 
-    progress_set(op_id, "Authenticating...")
+    progress_set(progress_op_id, "Authenticating...")
+
     payload = {
         "login_user[login]": ALDI_USERNAME,
         "login_user[password]": ALDI_PASSWORD,
         "_csrf_token": csrf,
     }
 
-    login_resp = _http_post(
-        LOGIN_POST_URL,
-        data=payload,
-        headers={"Referer": LOGIN_PAGE_URL},
-    )
-    _raise_if_http_error(login_resp, "POST", LOGIN_POST_URL)
+    resp = _http_post(LOGIN_POST_URL, data=payload, headers={"Referer": LOGIN_PAGE_URL})
+    _raise_if_http_error(resp, "POST", LOGIN_POST_URL)
 
-    progress_set(op_id, "Authenticated")
-    maybe_progress_debug_delay()
-    ov2 = fetch(OVERVIEW_URL)
+    ov2 = _http_get(OVERVIEW_URL)
+    _raise_if_http_error(ov2, "GET", OVERVIEW_URL)
     if looks_like_login_page(ov2.text):
-        raise Exception("Login failed.")
-    return ov2.text
+        raise UpstreamError("LOGIN_FAILED", "Login failed.", stage="POST /login_check")
 
-# -----------------------
-# Parse overview
-# -----------------------
+    _LAST_LOGIN_OK_TS = time.time()
+    progress_set(progress_op_id, "Authenticated")
+
+
+# ============================================================
+# PROGRESS STORE (FILE-BASED, WORKER-SAFE)
+# ============================================================
+def _progress_read_all() -> dict:
+    if not os.path.exists(PROGRESS_PATH):
+        return {}
+    try:
+        with open(PROGRESS_PATH, "r", encoding="utf-8") as f:
+            try:
+                fcntl.flock(f.fileno(), fcntl.LOCK_SH)
+            except Exception:
+                pass
+            data = json.load(f)
+            return data if isinstance(data, dict) else {}
+    except Exception:
+        return {}
+
+
+def _progress_write_all(d: dict):
+    tmp = PROGRESS_PATH + ".tmp"
+    if os.path.dirname(PROGRESS_PATH):
+        os.makedirs(os.path.dirname(PROGRESS_PATH), exist_ok=True)
+    with open(tmp, "w", encoding="utf-8") as f:
+        try:
+            fcntl.flock(f.fileno(), fcntl.LOCK_EX)
+        except Exception:
+            pass
+        json.dump(d, f)
+        f.flush()
+        os.fsync(f.fileno())
+    os.replace(tmp, PROGRESS_PATH)
+
+
+def progress_init(msg: str = "Starting...") -> str:
+    op_id = uuid.uuid4().hex
+    d = _progress_read_all()
+    d[op_id] = {
+        "msg": msg,
+        "seq": 1,
+        "done": False,
+        "ok": True,
+        "result": None,
+        "ts": time.time(),
+    }
+    _progress_write_all(d)
+    return op_id
+
+
+def progress_set(op_id: str | None, msg: str):
+    if not op_id:
+        return
+    d = _progress_read_all()
+    st = d.get(op_id)
+    if not isinstance(st, dict):
+        return
+    st["msg"] = msg
+    st["seq"] = int(st.get("seq", 0)) + 1
+    st["ts"] = time.time()
+    d[op_id] = st
+    _progress_write_all(d)
+
+
+def progress_done(op_id: str | None, ok: bool, result=None):
+    if not op_id:
+        return
+    d = _progress_read_all()
+    st = d.get(op_id)
+    if not isinstance(st, dict):
+        return
+    st["done"] = True
+    st["ok"] = bool(ok)
+    st["result"] = result
+    st["ts"] = time.time()
+    d[op_id] = st
+    _progress_write_all(d)
+
+
+def progress_complete(op_id: str | None, result=None):
+    progress_set(op_id, "Complete")
+    progress_done(op_id, True, result)
+
+
+# ============================================================
+# LIMITS (SLOW) - FETCH ONCE FROM OVERVIEW FOR ALL MOBILES
+# ============================================================
+def _parse_limits_from_overview_html(html: str) -> dict[str, float | None]:
+    soup = BeautifulSoup(html or "", "html.parser")
+    out: dict[str, float | None] = {m: None for m in MOBILES}
+
+    for m in MOBILES:
+        service_div = soup.find("div", attrs={"data-service_number": m})
+        if not service_div:
+            continue
+        panel = service_div.find_parent("div", class_="panel")
+        if not panel:
+            continue
+
+        div = panel.find("div", id=lambda x: x and x.startswith("usageLimitDivconsumerUsageLimit"))
+        txt = div.get_text(" ", strip=True) if div else ""
+        out[m] = _parse_float_from_text(txt)
+
+    return out
+
+
+def get_limits(progress_op_id: str | None = None, force: bool = False) -> dict[str, float | None]:
+    now = time.time()
+    if (not force) and _LIMIT_CACHE.get("limits") and (now - float(_LIMIT_CACHE.get("ts", 0.0)) < LIMIT_CACHE_TTL_SECONDS):
+        return dict(_LIMIT_CACHE["limits"])
+
+    ensure_logged_in(progress_op_id)
+    progress_set(progress_op_id, "Loading limits (overview)...")
+
+    ov = _http_get(OVERVIEW_URL)
+    _raise_if_http_error(ov, "GET", OVERVIEW_URL)
+    if looks_like_login_page(ov.text):
+        global _LAST_LOGIN_OK_TS
+        _LAST_LOGIN_OK_TS = 0.0
+        ensure_logged_in(progress_op_id)
+        ov = _http_get(OVERVIEW_URL)
+        _raise_if_http_error(ov, "GET", OVERVIEW_URL)
+
+    limits = _parse_limits_from_overview_html(ov.text)
+    _LIMIT_CACHE["ts"] = time.time()
+    _LIMIT_CACHE["limits"] = dict(limits)
+    return limits
+
+
+# ============================================================
+# BALANCE (FAST) - PER MOBILE ENDPOINT
+# ============================================================
+def _extract_balance_items(js: dict) -> tuple[float | None, float | None]:
+    remaining_mb = None
+    used_mb = None
+
+    items = js.get("resource_items") or js.get("RESOURCE_BALANCE") or []
+    for it in items:
+        plan_name = (it.get("plan_name") or it.get("PLAN_NAME") or "").strip().lower()
+        v = it.get("value") if "value" in it else it.get("VALUE")
+        if not isinstance(plan_name, str):
+            continue
+        if "plan data remaining" in plan_name:
+            remaining_mb = v
+        elif "data usage counter" in plan_name:
+            used_mb = v
+
+    rem_gb = _mb_to_gb(remaining_mb) if remaining_mb is not None else None
+    used_gb = _mb_to_gb(used_mb) if used_mb is not None else None
+    return rem_gb, used_gb
+
+
+def fetch_balance_json(mobile: str, progress_op_id: str | None = None) -> dict:
+    url = BALANCE_URL_TMPL.format(mobile=mobile)
+
+    r = _http_get(url, headers={"Accept": "application/json,*/*"})
+    _raise_if_http_error(r, "GET", url)
+
+    ctype = (r.headers.get("Content-Type") or "").lower()
+    if ("application/json" not in ctype) or (r.text and r.text.lstrip().startswith("<")):
+        global _LAST_LOGIN_OK_TS
+        _LAST_LOGIN_OK_TS = 0.0
+        ensure_logged_in(progress_op_id)
+        r = _http_get(url, headers={"Accept": "application/json,*/*"})
+        _raise_if_http_error(r, "GET", url)
+
+    try:
+        return r.json()
+    except Exception:
+        raise UpstreamError("BALANCE_PARSE_FAIL", "Failed to parse balance JSON.", stage=f"GET {_url_path(url)}")
+
+
+# ============================================================
+# STATUS LINE BUILDING
+# ============================================================
+def build_line_for_mobile(mobile: str, limits: dict[str, float | None], bal_json: dict) -> str:
+    plan_remaining_gb, used_gb = _extract_balance_items(bal_json)
+    lim = limits.get(mobile)
+
+    remaining_gb = None
+    if lim is not None and used_gb is not None and lim > 0:
+        remaining_gb = max(lim - used_gb, 0.0)
+    else:
+        remaining_gb = plan_remaining_gb
+
+    return f"Limit: {_fmt_gb(lim)}  >  Used: {_fmt_gb(used_gb)}  >  Remaining: {_fmt_gb(remaining_gb)}"
+
+
+def cache_set(mobile: str, line: str, status: str, error_code: str | None = None, error_ts: str | None = None):
+    with _CACHE_LOCK:
+        cache[mobile] = {
+            "ts": time.time(),
+            "line": line,
+            "status": status,
+            "error_code": error_code,
+            "error_ts": error_ts,
+        }
+
+
+def cache_get(mobile: str):
+    with _CACHE_LOCK:
+        item = cache.get(mobile)
+    if not item:
+        return None
+    if time.time() - float(item.get("ts", 0.0)) > CACHE_TTL_SECONDS:
+        return None
+    return item
+
+
+# ============================================================
+# UPDATE LIMIT (MANUAL/SCHEDULER) - NEEDS OVERVIEW FORM/TOKEN
+# ============================================================
 def get_panel_for_mobile(html: str, mobile: str):
-    soup = BeautifulSoup(html, "html.parser")
+    soup = BeautifulSoup(html or "", "html.parser")
     service_div = soup.find("div", attrs={"data-service_number": mobile})
     if not service_div:
         raise Exception(f"Mobile {mobile} not found on overview page.")
@@ -296,62 +533,22 @@ def get_panel_for_mobile(html: str, mobile: str):
         raise Exception("Panel not found.")
     return panel
 
-def status_from_text(text: str, tzname: str) -> str:
-    if "pending" in (text or "").lower():
-        return "Pending"
-    return now_ts_str(tzname)
 
-def get_limit_text_and_status(mobile: str, op_id: str | None = None):
-    cached = cache_get(mobile)
-    if cached:
-        return cached["current"], cached["status"]
-
-    cfg = load_cfg()
-    tzname = cfg.get("timezone", "Australia/Brisbane")
-
-    progress_set(op_id, "Retrieving usage data...")
-    maybe_progress_debug_delay()
-    html = ensure_logged_in(op_id=op_id)
-
-    progress_set(op_id, "Retrieving usage data...")
-    panel = get_panel_for_mobile(html, mobile)
-
-    div = panel.find("div", id=lambda x: x and x.startswith("usageLimitDivconsumerUsageLimit"))
-    limit_text = div.get_text(" ", strip=True) if div else ""
-
-    usage_text = ""
-    usage_div = panel.find("div", id=lambda x: x and x.startswith("usageDivconsumerUsage"))
-    if usage_div:
-        usage_text = usage_div.get_text(" ", strip=True)
-
-    if not usage_text:
-        panel_text = " ".join(panel.get_text("\n", strip=True).split())
-        m = re.search(r"((?:usage|used|remaining|left)[^\n]*?\d+(?:\.\d+)?\s*(?:GB|MB)|\d+(?:\.\d+)?\s*(?:GB|MB)[^\n]*?(?:used|remaining|left))", panel_text, flags=re.IGNORECASE)
-        if m:
-            usage_text = m.group(1).strip()
-
-    if usage_text and limit_text:
-        current = f"{usage_text} · Set: {limit_text}"
-    elif usage_text:
-        current = usage_text
-    else:
-        current = limit_text or "Unknown"
-
-    status = status_from_text(current, tzname)
-
-    cache_set(mobile, current, status)
-    progress_set(op_id, "Complete")
-    return current, status
-
-# -----------------------
-# Update limit
-# -----------------------
 def submit_limit_form(mobile: str, value: str, op_id: str | None = None):
-    progress_set(op_id, "Ensuring session is logged in...")
-    html = ensure_logged_in(op_id=op_id)
+    ensure_logged_in(op_id)
 
-    progress_set(op_id, f"Finding {mobile} in family plan...")
-    panel = get_panel_for_mobile(html, mobile)
+    progress_set(op_id, "Loading overview for update...")
+    ov = _http_get(OVERVIEW_URL)
+    _raise_if_http_error(ov, "GET", OVERVIEW_URL)
+    if looks_like_login_page(ov.text):
+        global _LAST_LOGIN_OK_TS
+        _LAST_LOGIN_OK_TS = 0.0
+        ensure_logged_in(op_id)
+        ov = _http_get(OVERVIEW_URL)
+        _raise_if_http_error(ov, "GET", OVERVIEW_URL)
+
+    progress_set(op_id, f"Finding {display_name(mobile)} in family plan...")
+    panel = get_panel_for_mobile(ov.text, mobile)
 
     form = panel.find("form", class_="consumerDataLimitForm")
     if not form:
@@ -376,56 +573,79 @@ def submit_limit_form(mobile: str, value: str, op_id: str | None = None):
     action = form.get("action")
     post_url = urljoin(OVERVIEW_URL, action) if action else OVERVIEW_URL
 
-    progress_set(op_id, f"Submitting usage limit update ({mobile} -> {value}GB)...")
-    resp = _http_post(
-        post_url,
-        data=payload,
-        headers={"Referer": OVERVIEW_URL},
-    )
+    progress_set(op_id, f"Submitting limit update ({display_name(mobile)} -> {value}GB)...")
+    resp = _http_post(post_url, data=payload, headers={"Referer": OVERVIEW_URL})
     _raise_if_http_error(resp, "POST", post_url)
-    cache.pop(mobile, None)
+
+    try:
+        new_lim = float(str(value).strip())
+    except Exception:
+        new_lim = None
+    if isinstance(_LIMIT_CACHE.get("limits"), dict):
+        _LIMIT_CACHE["limits"][mobile] = new_lim
+        _LIMIT_CACHE["ts"] = time.time()
+
+    with _CACHE_LOCK:
+        cache.pop(mobile, None)
+
 
 def wait_until_done(mobile: str, op_id: str | None = None):
     start = time.time()
     while True:
-        current, status = get_limit_text_and_status(mobile, op_id=op_id)
-        if status != "Pending":
-            return True, current, round(time.time() - start, 1)
+        ensure_logged_in(op_id)
+        ov = _http_get(OVERVIEW_URL)
+        _raise_if_http_error(ov, "GET", OVERVIEW_URL)
+        panel = get_panel_for_mobile(ov.text, mobile)
+        panel_text = " ".join(panel.get_text("\n", strip=True).split()).lower()
+        pending = "pending" in panel_text
+
+        if not pending:
+            return True, round(time.time() - start, 1)
 
         progress_set(op_id, "Waiting for ALDI to finish pending update...")
         if time.time() - start > POLL_TIMEOUT_SECONDS:
-            return False, current, round(time.time() - start, 1)
+            return False, round(time.time() - start, 1)
 
-        cache.pop(mobile, None)
         time.sleep(POLL_INTERVAL_SECONDS)
+
 
 def set_limit_and_wait(mobile: str, value: str, op_id: str | None = None):
     submit_limit_form(mobile, value, op_id=op_id)
-    done, final_text, elapsed = wait_until_done(mobile, op_id=op_id)
-    return {"mobile": mobile, "requested": value, "done": done, "final": final_text, "elapsed": elapsed}
+    done, elapsed = wait_until_done(mobile, op_id=op_id)
 
-# -----------------------
-# Scheduler config
-# -----------------------
+    limits = get_limits(op_id, force=False)
+    bal = fetch_balance_json(mobile, op_id)
+    line = build_line_for_mobile(mobile, limits, bal)
+
+    cfg = load_cfg()
+    tzname = cfg.get("timezone", "Australia/Brisbane")
+    cache_set(mobile, line, now_ts_str(tzname))
+
+    return {"mobile": mobile, "requested": value, "done": done, "elapsed": elapsed, "line": line}
+
+
+# ============================================================
+# SCHEDULER CONFIG
+# ============================================================
 DAYS = ["mon", "tue", "wed", "thu", "fri", "sat", "sun"]
 DAY_LABELS = ["Mon", "Tue", "Wed", "Thu", "Fri", "Sat", "Sun"]
-
 WEEKDAY_INDEX = {"mon": 0, "tue": 1, "wed": 2, "thu": 3, "fri": 4, "sat": 5, "sun": 6}
+
 
 def empty_week():
     return {d: [{"time": "", "value": ""} for _ in range(4)] for d in DAYS}
 
+
 def empty_default_row():
     return [{"time": "", "value": ""} for _ in range(4)]
+
 
 def default_config():
     return {
         "timezone": "Australia/Brisbane",
-        "mobiles": {
-            m: {"enabled": True, "default": empty_default_row(), "week": empty_week()}
-            for m in MOBILES
-        }
+        "mobiles": {m: {"enabled": True, "default": empty_default_row(), "week": empty_week()} for m in MOBILES},
     }
+
 
 def _ensure_cfg_shape(cfg: dict) -> dict:
     cfg = cfg if isinstance(cfg, dict) else {}
@@ -467,18 +687,19 @@ def _ensure_cfg_shape(cfg: dict) -> dict:
     cfg["mobiles"] = out
     return cfg
 
+
 def save_cfg(cfg):
     tmp = CONFIG_PATH + ".tmp"
     with open(tmp, "w", encoding="utf-8") as f:
         json.dump(cfg, f, indent=2)
     os.replace(tmp, CONFIG_PATH)
 
+
 def load_cfg():
     if not os.path.exists(CONFIG_PATH):
         cfg = _ensure_cfg_shape(default_config())
         save_cfg(cfg)
         return cfg
-
     try:
         with open(CONFIG_PATH, "r", encoding="utf-8") as f:
             cfg = json.load(f)
@@ -486,7 +707,6 @@ def load_cfg():
         cfg = _ensure_cfg_shape(default_config())
         save_cfg(cfg)
         return cfg
-
     cfg = _ensure_cfg_shape(cfg)
     try:
         save_cfg(cfg)
@@ -494,66 +714,6 @@ def load_cfg():
         pass
     return cfg
 
-# -----------------------
-# APScheduler
-# -----------------------
-scheduler = None
-
-def start_scheduler():
-    global scheduler
-    if scheduler is not None:
-        return
-    cfg = load_cfg()
-    tz = pytz.timezone(cfg["timezone"])
-    scheduler = BackgroundScheduler(timezone=tz)
-    scheduler.start()
-    reload_jobs()
-
-def reload_jobs():
-    global scheduler
-    if scheduler is None:
-        return
-
-    for job in scheduler.get_jobs():
-        scheduler.remove_job(job.id)
-
-    cfg = load_cfg()
-    tz = pytz.timezone(cfg["timezone"])
-
-    for mobile, mcfg in cfg["mobiles"].items():
-        if not bool(mcfg.get("enabled", False)):
-            continue
-
-        week = mcfg.get("week", {})
-        for day in DAYS:
-            slots = week.get(day, [])
-            for i in range(4):
-                slot = slots[i] if i < len(slots) else {"time": "", "value": ""}
-                t = (slot.get("time") or "").strip()
-                v = (slot.get("value") or "").strip()
-                if not t or not v or ":" not in t:
-                    continue
-                hh, mm = t.split(":", 1)
-                if not (hh.isdigit() and mm.isdigit()):
-                    continue
-
-                job_id = f"{mobile}_{day}_slot{i}"
-                trigger = CronTrigger(day_of_week=day, hour=int(hh), minute=int(mm), timezone=tz)
-                scheduler.add_job(
-                    func=run_scheduled_set,
-                    trigger=trigger,
-                    id=job_id,
-                    replace_existing=True,
-                    args=[mobile, v],
-                    misfire_grace_time=180,
-                )
-
-def run_scheduled_set(mobile: str, value: str):
-    try:
-        res = set_limit_and_wait(mobile, value, op_id=None)
-        print(f"[SCHEDULE] {mobile} -> {value} | done={res['done']} | final={res['final']} | {res['elapsed']}s")
-    except Exception as e:
-        print(f"[SCHEDULE] ERROR {mobile} -> {value}: {e}")
 
 def format_gb_value(value: str) -> str:
     try:
@@ -561,10 +721,10 @@ def format_gb_value(value: str) -> str:
     except Exception:
         return str(value).strip()
 
+
 def get_next_scheduled_change(mcfg: dict, tzname: str):
     if not bool((mcfg or {}).get("enabled", False)):
         return None
-
     try:
         tz = pytz.timezone(tzname)
     except Exception:
@@ -609,12 +769,93 @@ def get_next_scheduled_change(mcfg: dict, tzname: str):
         "next_change_gb": format_gb_value(best["value"]),
     }
 
-# -----------------------
-# Routes
-# -----------------------
+
+def _try_acquire_scheduler_lock() -> bool:
+    global _sched_lock_fd
+    if _sched_lock_fd is not None:
+        return True
+    try:
+        fd = os.open(SCHED_LOCK_PATH, os.O_CREAT | os.O_RDWR, 0o644)
+        fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        _sched_lock_fd = fd
+        return True
+    except Exception:
+        try:
+            if "fd" in locals():
+                os.close(fd)
+        except Exception:
+            pass
+        return False
+
+
+def start_scheduler():
+    global scheduler
+    if scheduler is not None:
+        return
+    if not _try_acquire_scheduler_lock():
+        return
+
+    cfg = load_cfg()
+    tz = pytz.timezone(cfg["timezone"])
+    scheduler = BackgroundScheduler(timezone=tz)
+    scheduler.start()
+    reload_jobs()
+
+
+def reload_jobs():
+    global scheduler
+    if scheduler is None:
+        return
+
+    for job in scheduler.get_jobs():
+        scheduler.remove_job(job.id)
+
+    cfg = load_cfg()
+    tz = pytz.timezone(cfg["timezone"])
+
+    for mobile, mcfg in cfg["mobiles"].items():
+        if not bool(mcfg.get("enabled", False)):
+            continue
+        week = mcfg.get("week", {})
+        for day in DAYS:
+            slots = week.get(day, [])
+            for i in range(4):
+                slot = slots[i] if i < len(slots) else {"time": "", "value": ""}
+                t = (slot.get("time") or "").strip()
+                v = (slot.get("value") or "").strip()
+                if not t or not v or ":" not in t:
+                    continue
+                hh, mm = t.split(":", 1)
+                if not (hh.isdigit() and mm.isdigit()):
+                    continue
+
+                job_id = f"{mobile}_{day}_slot{i}"
+                trigger = CronTrigger(day_of_week=day, hour=int(hh), minute=int(mm), timezone=tz)
+                scheduler.add_job(
+                    func=run_scheduled_set,
+                    trigger=trigger,
+                    id=job_id,
+                    replace_existing=True,
+                    args=[mobile, v],
+                    misfire_grace_time=180,
+                )
+
+
+def run_scheduled_set(mobile: str, value: str):
+    try:
+        res = set_limit_and_wait(mobile, value, op_id=None)
+        print(f"[SCHEDULE] {mobile} -> {value} | done={res['done']} | {res['elapsed']}s")
+    except Exception as e:
+        print(f"[SCHEDULE] ERROR {mobile} -> {value}: {e}")
+
+
+# ============================================================
+# ROUTES
+# ============================================================
 @app.get("/healthz")
 def healthz():
     return jsonify({"ok": True}), 200
+
 
 @app.get("/health/upstream")
 def health_upstream():
@@ -625,24 +866,13 @@ def health_upstream():
             _raise_if_http_error(r, "HEAD", target)
         return jsonify({"ok": True, "stage": "HEAD", "error_code": None}), 200
     except UpstreamError as e:
-        if e.error_code.startswith("HTTP_"):
-            return jsonify({"ok": False, "stage": e.stage, "error_code": e.error_code}), 503
-        try:
-            r2 = _http_get(target, timeout=5)
-            if r2.status_code >= 400:
-                _raise_if_http_error(r2, "GET", target)
-            return jsonify({"ok": True, "stage": "GET", "error_code": None}), 200
-        except UpstreamError as e2:
-            app.logger.warning("Upstream health failed stage=%s code=%s", e2.stage, e2.error_code)
-            return jsonify({"ok": False, "stage": e2.stage, "error_code": e2.error_code}), 503
+        return jsonify({"ok": False, "stage": e.stage, "error_code": e.error_code}), 503
     except Exception:
-        app.logger.exception("Unexpected upstream health failure")
         return jsonify({"ok": False, "stage": "health_upstream", "error_code": "UNKNOWN"}), 503
+
 
 @app.route("/")
 def home():
-    route_start = time.perf_counter()
-    app.logger.warning("[home] start rendering /")
     cfg = load_cfg()
     tzname = cfg.get("timezone", "Australia/Brisbane")
 
@@ -651,18 +881,29 @@ def home():
         mcfg = cfg["mobiles"].get(m, {})
         enabled = bool(mcfg.get("enabled", False))
         next_change = get_next_scheduled_change(mcfg, tzname)
-        error_code = None
-        error_ts = None
+
         cached = cache_get(m)
         if cached:
-            cur = cached.get("current", "Loading...")
-            st = cached.get("status", "Pending")
-            if cached.get("status") == "Error":
-                error_code = cached.get("error_code")
-                error_ts = cached.get("error_ts")
+            line = cached.get("line", "Loading...")
+            st = cached.get("status", "Loading...")
+            error_code = cached.get("error_code")
+            error_ts = cached.get("error_ts")
         else:
-            cur, st = "Loading...", "Pending"
-        item = {"mobile": m, "enabled": enabled, "current": cur, "status": st, "error_code": error_code, "error_ts": error_ts}
+            line = "Loading..."
+            st = "Loading..."
+            error_code = None
+            error_ts = None
+
+        item = {
+            "mobile": m,
+            "display": display_name(m),
+            "enabled": enabled,
+            "line": line,
+            "status": st,
+            "status_class": _status_class(st),
+            "error_code": error_code,
+            "error_ts": error_ts,
+        }
         if next_change:
             item.update(next_change)
         items.append(item)
@@ -672,7 +913,7 @@ def home():
 <html>
 <head>
 <meta name="viewport" content="width=device-width,initial-scale=1">
-<title>ALDI Data</title>
+<title>ALDI App</title>
 <style>
 body{font-family:Arial;background:#fafafa;padding:16px}
 .card{background:#fff;border:1px solid #ddd;border-radius:10px;padding:14px;margin-bottom:12px}
@@ -686,16 +927,17 @@ input,button{width:100%;padding:10px;font-size:14px;border-radius:10px;border:1p
 button{background:#f3f3f3;cursor:pointer}
 a{color:#1a5cff;text-decoration:none}
 
-.spinner-overlay{display:flex;justify-content:center;align-items:center}
+.spinner-overlay{display:none;position:fixed;inset:0;z-index:99999;background:rgba(255,255,255,0.85);justify-content:center;align-items:center}
 .spinner{border:6px solid #f3f3f3;border-top:6px solid #3498db;border-radius:50%;width:50px;height:50px;animation:spin 1s linear infinite}
 @keyframes spin{0%{transform:rotate(0deg)}100%{transform:rotate(360deg)}}
 </style>
 </head>
 <body>
-<div id="spinnerOverlay" class="spinner-overlay" style="display:flex;position:fixed;inset:0;z-index:99999;background:rgba(255,255,255,0.85);">
+
+<div id="spinnerOverlay" class="spinner-overlay">
   <div style="display:flex;flex-direction:column;align-items:center;gap:12px;">
     <div class="spinner"></div>
-    <div id="progressText" style="font-size:14px;color:#333;text-align:center;max-width:320px;">Loading...</div>
+    <div id="progressText" style="font-size:14px;color:#333;text-align:center;max-width:340px;">Loading...</div>
   </div>
 </div>
 
@@ -715,26 +957,26 @@ a{color:#1a5cff;text-decoration:none}
     <div class="row"><a href="/matrix-all">Scheduler</a></div>
     <button onclick="refreshNow()" style="width:auto;padding:8px 12px;border-radius:10px;">Refresh</button>
   </div>
-  <div class="small">Use Refresh or Manual Update to pull new status. Progress messages appear during operations.</div>
+  <div class="small">Cached values show instantly, then latest loads with step-by-step progress.</div>
 </div>
 
 {% for it in items %}
 <div class="card">
   <div class="row">
-    <b>{{it.mobile}}</b>
+    <b>{{it.display}}</b>
     <span class="pill">{{"Scheduler ON" if it.enabled else "Scheduler OFF"}}</span>
-    {% if it.status == "Pending" %}
-      <span class="pill pending">Pending</span>
-    {% elif it.status == "Error" %}
-      <span class="pill err">Error</span>
-    {% else %}
-      <span class="pill ok">{{it.status}}</span>
-    {% endif %}
+
+    <span id="status-{{it.mobile}}" class="pill {{it.status_class}}">{{it.status}}</span>
+
     {% if it.next_change_label and it.next_change_gb %}
-      <span class="pill pending">Next: {{it.next_change_label}} &rarr; {{it.next_change_gb}} GB</span>
+      <span id="next-{{it.mobile}}" class="pill pending">Next: {{it.next_change_label}} → {{it.next_change_gb}} GB</span>
     {% endif %}
   </div>
-  <div style="margin-top:6px;">Current: <span id="current-{{it.mobile}}">{{it.current}}</span></div>
+
+  <div style="margin-top:8px;">
+    <span id="line-{{it.mobile}}" style="font-weight:600">{{it.line}}</span>
+  </div>
+
   {% if it.error_code %}
   <details id="error-box-{{it.mobile}}" style="margin-top:6px;">
     <summary style="cursor:pointer;color:#666;">Details</summary>
@@ -756,48 +998,25 @@ a{color:#1a5cff;text-decoration:none}
 
 <script>
 function showOverlay(msg){
-  document.getElementById("spinnerOverlay").style.display="flex";
+  const ov = document.getElementById("spinnerOverlay");
+  ov.style.display="flex";
   document.getElementById("progressText").innerText = msg || "Working...";
 }
 function setProgress(msg){
   document.getElementById("progressText").innerText = msg || "Working...";
 }
-function hideOverlay(){ document.getElementById("spinnerOverlay").style.display="none"; }
+function hideOverlay(){
+  document.getElementById("spinnerOverlay").style.display="none";
+}
 
 let activeOpId = null;
 
-function navMessageForHref(href){
-  const low = (href || "").toLowerCase();
-  if(low.includes("login")) return "Logging in...";
-  if(low.includes("family")) return "Opening family plan...";
-  if(low.includes("matrix") || low.includes("scheduler")) return "Opening scheduler...";
-  return "Loading...";
+function statusClassFor(status){
+  const s = (status || "").trim();
+  if(s === "Error") return "err";
+  if(s === "Pending" || s === "Loading...") return "pending";
+  return "ok";
 }
-
-document.addEventListener("click", function(ev){
-  if(ev.defaultPrevented || ev.button !== 0) return;
-  if(ev.metaKey || ev.ctrlKey || ev.shiftKey || ev.altKey) return;
-
-  const a = ev.target.closest("a[href]");
-  if(!a) return;
-  if((a.getAttribute("target") || "").toLowerCase() === "_blank") return;
-
-  const href = (a.getAttribute("href") || "").trim();
-  if(!href || href.startsWith("#") || href.toLowerCase().startsWith("javascript:")) return;
-
-  try{
-    const u = new URL(a.href, window.location.href);
-    if(u.origin !== window.location.origin) return;
-  }catch(e){
-    return;
-  }
-  showOverlay(navMessageForHref(href));
-}, true);
-
-document.addEventListener("submit", function(ev){
-  if(ev.defaultPrevented) return;
-  showOverlay("Working...");
-}, true);
 
 async function pollProgress(opId, onDone){
   activeOpId = opId;
@@ -834,6 +1053,30 @@ async function pollProgress(opId, onDone){
   poll();
 }
 
+function applyItemsToDom(items){
+  for(const it of (items || [])){
+    const lineEl = document.getElementById(`line-${it.mobile}`);
+    if(lineEl) lineEl.innerText = it.line || "—";
+
+    const stEl = document.getElementById(`status-${it.mobile}`);
+    if(stEl){
+      const st = it.status || "Loading...";
+      stEl.textContent = st;
+      stEl.classList.remove("pending","ok","err");
+      stEl.classList.add(statusClassFor(st));
+    }
+
+    const detailsText = document.getElementById(`details-${it.mobile}`);
+    const detailsBox = document.getElementById(`error-box-${it.mobile}`);
+    if(it.error_code){
+      if(detailsText) detailsText.innerText = `Code: ${it.error_code}${it.error_ts ? ` · ${it.error_ts}` : ""}`;
+      if(detailsBox) detailsBox.style.display = "block";
+    }else if(detailsBox){
+      detailsBox.style.display = "none";
+    }
+  }
+}
+
 async function startUpdate(ev, mobile){
   ev.preventDefault();
   const value = (ev.target.querySelector('input[name="value"]').value || "").trim();
@@ -851,7 +1094,7 @@ async function startUpdate(ev, mobile){
     alert(j.error || "Failed to start update");
     return false;
   }
-  pollProgress(j.op_id);
+  pollProgress(j.op_id, () => window.location.reload());
   return false;
 }
 
@@ -864,7 +1107,7 @@ async function refreshNow(){
     alert(j.error || "Failed to start refresh");
     return;
   }
-  pollProgress(j.op_id);
+  pollProgress(j.op_id, () => window.location.reload());
 }
 
 async function loadHomeStatus(){
@@ -875,19 +1118,7 @@ async function loadHomeStatus(){
     if(!j.ok) throw new Error(j.error || "Failed to load status");
 
     pollProgress(j.op_id, (result) => {
-      for(const it of (result.items || [])){
-        const currentEl = document.getElementById(`current-${it.mobile}`);
-        if(currentEl) currentEl.innerText = it.current || "Unknown";
-
-        const detailsText = document.getElementById(`details-${it.mobile}`);
-        const detailsBox = document.getElementById(`error-box-${it.mobile}`);
-        if(it.error_code){
-          if(detailsText) detailsText.innerText = `Code: ${it.error_code}${it.error_ts ? ` · ${it.error_ts}` : ""}`;
-          if(detailsBox) detailsBox.style.display = "block";
-        }else if(detailsBox){
-          detailsBox.style.display = "none";
-        }
-      }
+      applyItemsToDom(result.items || []);
       hideOverlay();
     });
   }catch(e){
@@ -896,258 +1127,140 @@ async function loadHomeStatus(){
   }
 }
 
-window.addEventListener("load", () => {
-  loadHomeStatus();
-});
-</script>
-
-<script>
-window.addEventListener("pageshow", (e) => {
-  if (e.persisted && !activeOpId) hideOverlay();
-});
-</script>
-
-
-<script>
-function copyDefaults(mobile){
-  try{
-    console.log("[copyDefaults] clicked for", mobile);
-
-    const days = ["mon","tue","wed","thu","fri","sat","sun"];
-    for(let i=0;i<4;i++){
-      const dt = document.getElementById(`default_time_${mobile}_${i}`);
-      const dv = document.getElementById(`default_value_${mobile}_${i}`);
-
-      if(!dt || !dv){
-        console.warn("[copyDefaults] missing default inputs", {mobile, i, dt:!!dt, dv:!!dv});
-        return;
-      }
-
-      const t = dt.value || "";
-      const v = dv.value || "";
-
-      for(const d of days){
-        const ti = document.getElementById(`time_${mobile}_${d}_${i}`);
-        const vi = document.getElementById(`value_${mobile}_${d}_${i}`);
-        if(ti) ti.value = t;
-        if(vi) vi.value = v;
-      }
-    }
-
-    console.log("[copyDefaults] done for", mobile);
-  }catch(e){
-    console.error("[copyDefaults] error", e);
-    alert("Copy Defaults failed — open browser console for details.");
-  }
-}_${i}`);
-    const dv = document.getElementById(`default_value_${mobile}_${i}`);
-
-    // If default inputs are missing, do nothing (prevents wiping schedules)
-    if(!dt || !dv){
-      console.warn("Default inputs missing for mobile:", mobile);
-      return;
-    }
-
-    const t = dt.value || "";
-    const v = dv.value || "";
-
-    for(const d of days){
-      const ti = document.getElementById(`time_${mobile}_${d}_${i}`);
-      const vi = document.getElementById(`value_${mobile}_${d}_${i}`);
-      if(ti) ti.value = t;
-      if(vi) vi.value = v;
-    }
-  }
-}_${i}`);
-    const dv = document.getElementById(`default_value_${mobile}_${i}`);
-    const t = dt ? dt.value : "";
-    const v = dv ? dv.value : "";
-    for(const d of days){
-      const ti = document.getElementById(`time_${mobile}_${d}_${i}`);
-      const vi = document.getElementById(`value_${mobile}_${d}_${i}`);
-      if(ti) ti.value = t;
-      if(vi) vi.value = v;
-    }
-  }
-}_${i}"]`)?.value || "";
-    const v = document.querySelector(`input[name="default_value_${mobile}_${i}"]`)?.value || "";
-    // Copy into each day slot
-    ["mon","tue","wed","thu","fri","sat","sun"].forEach(d=>{
-      const ti = document.querySelector(`input[name="time_${mobile}_${d}_${i}"]`);
-      const vi = document.querySelector(`input[name="value_${mobile}_${d}_${i}"]`);
-      if(ti) ti.value = t;
-      if(vi) vi.value = v;
-    });
-  }
-}
-</script>
-<script>
-
-document.addEventListener("click", function(e){
-  const btn = e.target.closest("button");
-  if(!btn) return;
-
-  const txt = (btn.textContent || "").toLowerCase();
-  if(!txt.includes("copy defaults")) return;
-
-  // Never submit forms
-  e.preventDefault();
-
-  const mobile = btn.getAttribute("data-mobile") || btn.dataset.mobile;
-  if(!mobile){
-    console.warn("[copyDefaults] button missing data-mobile");
-    return;
-  }
-  copyDefaults(mobile);
-});
-
-</script>
-
-<script>
-// Global: Copy Defaults -> All Days
-// (fills the form inputs; you still need to click Save to persist)
-window.copyDefaults = function(mobile){
-  try{
-    for(let i=0;i<4;i++){
-      const dt = document.getElementById(`default_time_${mobile}_${i}`);
-      const dv = document.getElementById(`default_value_${mobile}_${i}`);
-      if(!dt || !dv){
-        console.warn("Default inputs missing", {mobile, i});
-        alert("Default row inputs not found on page.");
-        return false;
-      }
-      const t = dt.value || "";
-      const v = dv.value || "";
-
-      // Copy into all day rows for this mobile + slot index
-      document.querySelectorAll(`input[id^="time_${mobile}_"][id$="_${i}"]`).forEach(el => el.value = t);
-      document.querySelectorAll(`input[id^="value_${mobile}_"][id$="_${i}"]`).forEach(el => el.value = v);
-    }
-    return false;
-  }catch(e){
-    console.error("copyDefaults failed", e);
-    alert("Copy Defaults failed — open browser console for details.");
-    return false;
-  }
-};
-</script>
-
-
-<script>
-window.copyDefaultsAndSave = async function(mobile){
-  try{
-    if (typeof window.copyDefaults === "function") {
-      window.copyDefaults(mobile);
-    }
-
-    const defaults = [];
-    for (let i=0;i<4;i++){
-      const dt = document.getElementById("default_time_" + mobile + "_" + i);
-      const dv = document.getElementById("default_value_" + mobile + "_" + i);
-      defaults.push({
-        time: dt ? (dt.value || "") : "",
-        value: dv ? (dv.value || "") : ""
-      });
-    }
-
-    const r = await fetch("/matrix-copy-defaults", {
-      method: "POST",
-      headers: {"Content-Type": "application/json"},
-      body: JSON.stringify({mobile: mobile, defaults: defaults})
-    });
-
-    let j = null;
-    try { j = await r.json(); } catch(e) {}
-
-      console.error("matrix-copy-defaults failed", r.status, j);
-      alert("Copy Defaults save failed. Check logs/console.");
-      return false;
-    }
-
-    window.location.reload();
-    return false;
-  }catch(e){
-    console.error("copyDefaultsAndSave failed", e);
-    alert("Copy Defaults save failed — open console for details.");
-    return false;
-  }
-};
+window.addEventListener("load", () => loadHomeStatus());
+window.addEventListener("pageshow", (e) => { if (e.persisted && !activeOpId) hideOverlay(); });
 </script>
 
 </body>
 </html>
 """
-    rendered = render_template_string(page, items=items)
-    app.logger.warning("[home] rendered / in %.3fs", time.perf_counter() - route_start)
-    return rendered
+    return render_template_string(page, items=items)
 
 
-@app.get("/api/home-status")
-def api_home_status():
-    start = time.perf_counter()
-    app.logger.warning("[api_home_status] started")
-    out = []
-    for m in MOBILES:
-        error_code = None
-        error_ts = None
-        try:
-            cur, st = get_limit_text_and_status(m, op_id=None)
-            cached = cache_get(m)
-            if cached and cached.get("status") == "Error":
-                error_code = cached.get("error_code")
-                error_ts = cached.get("error_ts")
-        except Exception as e:
-            app.logger.exception("Failed to load current status for mobile=%s", m)
-            cur, st = f"Error: {public_error_message(e)}", "Error"
-            error_code = _error_code_from_exception(e)
-            error_ts = _error_timestamp()
-        out.append({"mobile": m, "current": cur, "status": st, "error_code": error_code, "error_ts": error_ts})
-    app.logger.warning("[api_home_status] completed in %.3fs", time.perf_counter() - start)
-    return jsonify({"ok": True, "items": out})
+@app.route("/api/progress/<op_id>")
+def api_progress(op_id):
+    d = _progress_read_all()
+    st = d.get(op_id)
+    if not isinstance(st, dict):
+        return jsonify({"ok": False, "done": True, "msg": "Unknown operation", "seq": 0, "result": {"error": "Unknown operation"}})
+    return jsonify({"ok": st.get("ok", True), "done": st.get("done", False), "msg": st.get("msg", ""), "seq": st.get("seq", 0), "result": st.get("result")})
+
 
 @app.post("/api/home-status-start")
 def api_home_status_start():
-    op_id = progress_init("Retrieving usage data...")
+    op_id = progress_init("Preparing...")
 
     def worker():
-        start = time.perf_counter()
-        app.logger.warning("[api_home_status_start] started")
+        cfg = load_cfg()
+        tzname = cfg.get("timezone", "Australia/Brisbane")
         out = []
-        try:
-            for m in MOBILES:
-                error_code = None
-                error_ts = None
-                try:
-                    cur, st = get_limit_text_and_status(m, op_id=op_id)
-                    cached = cache_get(m)
-                    if cached and cached.get("status") == "Error":
-                        error_code = cached.get("error_code")
-                        error_ts = cached.get("error_ts")
-                except Exception as e:
-                    app.logger.exception("Failed to load current status for mobile=%s", m)
-                    cur, st = f"Error: {public_error_message(e)}", "Error"
-                    error_code = _error_code_from_exception(e)
-                    error_ts = _error_timestamp()
-                out.append({"mobile": m, "current": cur, "status": st, "error_code": error_code, "error_ts": error_ts})
 
-            app.logger.warning("[api_home_status_start] completed in %.3fs", time.perf_counter() - start)
+        try:
+            progress_set(op_id, "Loading limits...")
+            limits = get_limits(op_id, force=False)
+
+            progress_set(op_id, f"Fetching balances (0/{len(MOBILES)})...")
+            results: dict[str, dict] = {}
+
+            with ThreadPoolExecutor(max_workers=BALANCE_WORKERS) as ex:
+                futs = {ex.submit(fetch_balance_json, m, op_id): m for m in MOBILES}
+                done_count = 0
+                for fut in as_completed(futs):
+                    m = futs[fut]
+                    try:
+                        results[m] = fut.result()
+                    except Exception as e:
+                        results[m] = {"_error": public_error_message(e), "_exc": str(e)}
+                    done_count += 1
+                    progress_set(op_id, f"Fetching balances ({done_count}/{len(MOBILES)})...")
+
+            for m in MOBILES:
+                mcfg = cfg["mobiles"].get(m, {})
+                enabled = bool(mcfg.get("enabled", False))
+                next_change = get_next_scheduled_change(mcfg, tzname)
+
+                err_code = None
+                err_ts = None
+                try:
+                    js = results.get(m) or {}
+                    if "_error" in js:
+                        raise Exception(js["_error"])
+                    line = build_line_for_mobile(m, limits, js)
+                    status = now_ts_str(tzname)
+                    cache_set(m, line, status)
+                except Exception as e:
+                    line = f"Error: {public_error_message(e)}"
+                    status = "Error"
+                    err_code = "HOME_STATUS_FAIL"
+                    err_ts = _error_timestamp()
+                    cache_set(m, line, status, error_code=err_code, error_ts=err_ts)
+
+                cached = cache_get(m) or {}
+                item = {
+                    "mobile": m,
+                    "line": cached.get("line", line),
+                    "status": cached.get("status", status),
+                    "error_code": err_code,
+                    "error_ts": err_ts,
+                    "enabled": enabled,
+                }
+                if next_change:
+                    item.update(next_change)
+                out.append(item)
+
             progress_complete(op_id, {"items": out})
         except Exception as e:
-            app.logger.exception("Home status operation failed")
             progress_done(op_id, False, {"error": public_error_message(e)})
 
     threading.Thread(target=worker, daemon=True).start()
     return jsonify({"ok": True, "op_id": op_id})
 
-@app.route("/api/progress/<op_id>")
-def api_progress(op_id):
-    with PROGRESS_LOCK:
-        st = PROGRESS.get(op_id)
-    if not st:
-        return jsonify({"ok": False, "done": True, "msg": "Unknown operation", "seq": 0, "result": {"error": "Unknown operation"}})
-    return jsonify({"ok": st["ok"], "done": st["done"], "msg": st["msg"], "seq": st.get("seq", 0), "result": st["result"]})
 
-@app.route("/api/set-now-start", methods=["POST"])
+@app.post("/api/refresh-start")
+def api_refresh_start():
+    op_id = progress_init("Preparing...")
+
+    def worker():
+        cfg = load_cfg()
+        tzname = cfg.get("timezone", "Australia/Brisbane")
+        try:
+            progress_set(op_id, "Loading limits (fresh)...")
+            limits = get_limits(op_id, force=True)
+
+            progress_set(op_id, f"Fetching balances (0/{len(MOBILES)})...")
+            results: dict[str, dict] = {}
+
+            with ThreadPoolExecutor(max_workers=BALANCE_WORKERS) as ex:
+                futs = {ex.submit(fetch_balance_json, m, op_id): m for m in MOBILES}
+                done_count = 0
+                for fut in as_completed(futs):
+                    m = futs[fut]
+                    try:
+                        results[m] = fut.result()
+                    except Exception as e:
+                        results[m] = {"_error": public_error_message(e), "_exc": str(e)}
+                    done_count += 1
+                    progress_set(op_id, f"Fetching balances ({done_count}/{len(MOBILES)})...")
+
+            for m in MOBILES:
+                try:
+                    js = results.get(m) or {}
+                    if "_error" in js:
+                        raise Exception(js["_error"])
+                    line = build_line_for_mobile(m, limits, js)
+                    cache_set(m, line, now_ts_str(tzname))
+                except Exception as e:
+                    cache_set(m, f"Error: {public_error_message(e)}", "Error", error_code="REFRESH_FAIL", error_ts=_error_timestamp())
+
+            progress_complete(op_id, {"refreshed": True})
+        except Exception as e:
+            progress_done(op_id, False, {"error": public_error_message(e)})
+
+    threading.Thread(target=worker, daemon=True).start()
+    return jsonify({"ok": True, "op_id": op_id})
+
+
+@app.post("/api/set-now-start")
 def api_set_now_start():
     mobile = (request.form.get("mobile") or "").strip()
     value = (request.form.get("value") or "").strip()
@@ -1164,41 +1277,11 @@ def api_set_now_start():
             res = set_limit_and_wait(mobile, value, op_id=op_id)
             progress_complete(op_id, res)
         except Exception as e:
-            app.logger.exception("Manual update failed for mobile=%s", mobile)
             progress_done(op_id, False, {"error": public_error_message(e)})
 
     threading.Thread(target=worker, daemon=True).start()
     return jsonify({"ok": True, "op_id": op_id})
 
-@app.route("/api/refresh-start", methods=["POST"])
-def api_refresh_start():
-    op_id = progress_init("Authenticating...")
-
-    def worker():
-        try:
-            had_upstream_error = False
-            for i, m in enumerate(MOBILES, start=1):
-                progress_set(op_id, f"Retrieving usage data... ({i}/{len(MOBILES)})")
-                try:
-                    get_limit_text_and_status(m, op_id=op_id)
-                except Exception as e:
-                    app.logger.exception("Refresh failed for mobile=%s", m)
-                    msg = public_error_message(e)
-                    code = _error_code_from_exception(e)
-                    if code in {"OUTBOUND_CONNECT_FAIL", "DNS_FAIL", "OUTBOUND_TIMEOUT", "TLS_FAIL"}:
-                        had_upstream_error = True
-                    cache_set(m, f"Error: {msg}", "Error", error_code=code, error_ts=_error_timestamp())
-
-            if had_upstream_error:
-                progress_done(op_id, False, {"error": f"{UPSTREAM_UNREACHABLE_MSG} Refresh could not contact upstream."})
-            else:
-                progress_complete(op_id, {"refreshed": True})
-        except Exception as e:
-            app.logger.exception("Refresh operation failed")
-            progress_done(op_id, False, {"error": public_error_message(e)})
-
-    threading.Thread(target=worker, daemon=True).start()
-    return jsonify({"ok": True, "op_id": op_id})
 
 @app.post("/matrix-copy-defaults")
 def matrix_copy_defaults():
@@ -1224,30 +1307,21 @@ def matrix_copy_defaults():
             slot = {"time": "", "value": ""}
         if not isinstance(slot, dict):
             slot = {"time": "", "value": ""}
-        norm.append({
-            "time": str(slot.get("time", "") or ""),
-            "value": str(slot.get("value", "") or "")
-        })
+        norm.append({"time": str(slot.get("time", "") or ""), "value": str(slot.get("value", "") or "")})
 
     week = cfg["mobiles"][mobile].setdefault("week", empty_week())
     for d in DAYS:
         week[d] = [dict(x) for x in norm]
 
     save_cfg(cfg)
+    reload_jobs()
     return jsonify(ok=True)
+
 
 @app.route("/matrix-all", methods=["GET", "POST"])
 def matrix_all():
-    # --- FIX: default mobile if none provided so GET /matrix-all never returns JSON ---
-    # Some code paths validate 'mobile' and return {"ok":false,"error":"invalid mobile"}.
-    # Ensure we always have a valid mobile for GET renders.
-    mobile = request.values.get("mobile") or ""
-    mobile = mobile.strip()
-    if not mobile:
-        mobile = MOBILES[0] if MOBILES else ""
-    # --- END FIX ---
-
     cfg = load_cfg()
+    tzname = cfg.get("timezone", "Australia/Brisbane")
 
     if request.method == "POST":
         cfg["timezone"] = (request.form.get("timezone") or "Australia/Brisbane").strip() or "Australia/Brisbane"
@@ -1273,7 +1347,6 @@ def matrix_all():
             cfg["mobiles"][m]["week"] = week
 
         save_cfg(cfg)
-        cache.clear()
         reload_jobs()
         return redirect(url_for("matrix_all"))
 
@@ -1306,7 +1379,9 @@ input[type="text"]{width:100%;padding:8px;border-radius:8px;border:1px solid #cc
 <h2 style="margin-top:12px;">Scheduler</h2>
 
 <div class="card small">
-  Use 24-hour time (HH:MM). Leave blank to disable a slot. Values are GB (e.g. 0, 20, 999).
+  <div><b>Server time:</b> {{server_utc}}</div>
+  <div><b>App timezone:</b> {{tzname}} &nbsp; <b>Now:</b> {{cfg_now}}</div>
+  <div style="margin-top:6px;">Use 24-hour time (HH:MM). Leave blank to disable a slot. Values are GB (e.g. 0, 20, 999).</div>
 </div>
 
 <form method="post">
@@ -1320,7 +1395,7 @@ input[type="text"]{width:100%;padding:8px;border-radius:8px;border:1px solid #cc
   {% set week = mcfg.get("week", {}) %}
   <div class="card">
     <div class="flex">
-      <div><b>{{m}}</b></div>
+      <div><b>{{display_name(m)}}</b></div>
       <label>
         <input type="checkbox" name="enabled_{{m}}" {% if mcfg.get("enabled") %}checked{% endif %}>
         Enable schedule
@@ -1328,76 +1403,32 @@ input[type="text"]{width:100%;padding:8px;border-radius:8px;border:1px solid #cc
     </div>
 
     <div class="card">
-
-
       <b>Default (4 slots)</b>
-
-
       <div class="small">Set these 4 slots, then copy them down to every day.</div>
-
 
       <div class="table-scroll">
       <table class="slot-table">
-
-
         <tr>
-
-
           <th>Default</th>
-
-
           {% for i in range(4) %}<th>Slot {{i+1}}</th>{% endfor %}
-
-
         </tr>
-
-
         <tr>
-
-
           <td><b>All days</b></td>
-
-
           {% for i in range(4) %}
-
-
           {% set dslot = (mcfg.get("default", [])[i] if (mcfg.get("default", [])|length) > i else {}) %}
-
-
           <td>
-
-
             <input type="text" name="default_time_{{m}}_{{i}}" placeholder="HH:MM" value="{{dslot.get('time','')}}" id="default_time_{{m}}_{{i}}">
-
-
             <input type="text" name="default_value_{{m}}_{{i}}" placeholder="GB" value="{{dslot.get('value','')}}" id="default_value_{{m}}_{{i}}">
-
-
           </td>
-
-
           {% endfor %}
-
-
         </tr>
-
-
       </table>
       </div>
 
-
       <div style="margin-top:10px;">
-
-
         <button data-mobile="{{m}}" type="button" class="btn" onclick="copyDefaultsAndSave('{{m}}'); return false;">Copy Defaults → All Days</button>
-
-
       </div>
-
-
     </div>
-
-
 
     <div style="margin-top:12px;">
       <div class="table-scroll">
@@ -1440,7 +1471,6 @@ window.copyDefaults = function(mobile){
         console.warn("[copyDefaults] missing default inputs", {mobile, i, dt: !!dt, dv: !!dv});
         return false;
       }
-
       const t = dt.value || "";
       const v = dv.value || "";
       for(const d of days){
@@ -1468,10 +1498,7 @@ window.copyDefaultsAndSave = async function(mobile){
     for (let i = 0; i < 4; i++) {
       const dt = document.getElementById(`default_time_${mobile}_${i}`);
       const dv = document.getElementById(`default_value_${mobile}_${i}`);
-      defaults.push({
-        time: dt ? (dt.value || "") : "",
-        value: dv ? (dv.value || "") : ""
-      });
+      defaults.push({ time: dt ? (dt.value || "") : "", value: dv ? (dv.value || "") : "" });
     }
 
     const r = await fetch("/matrix-copy-defaults", {
@@ -1500,8 +1527,21 @@ window.copyDefaultsAndSave = async function(mobile){
 </body>
 </html>
 """
-    return render_template_string(page, cfg=cfg, mobiles=MOBILES, days=list(zip(DAYS, DAY_LABELS)))
+    return render_template_string(
+        page,
+        cfg=cfg,
+        mobiles=MOBILES,
+        days=list(zip(DAYS, DAY_LABELS)),
+        tzname=tzname,
+        server_utc=server_utc_str(),
+        cfg_now=now_ts_str(tzname),
+        display_name=display_name,
+    )
 
+
+# ============================================================
+# MAIN
+# ============================================================
 if __name__ == "__main__":
     start_scheduler()
     app.run(host="0.0.0.0", port=5000, debug=False, use_reloader=False)

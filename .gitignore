@@ -2,3 +2,12 @@
 __pycache__/
 *.pyc
 schedule_matrix.json
+
+# junk files accidentally created
+Accept:
+GET
+Host:
+User-Agent:
+
+# backups
+app.py.bak.*
