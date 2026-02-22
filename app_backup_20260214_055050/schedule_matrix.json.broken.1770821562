@@ -1,0 +1,154 @@
+{
+  "timezone": "Australia/Brisbane",
+  "mobiles": {
+    "0494584269": {
+      "enabled": true,
+      "default": [
+        {
+          "time": "",
+          "value": ""
+        },
+        {
+          "time": "",
+          "value": ""
+        },
+        {
+          "time": "",
+          "value": ""
+        },
+        {
+          "time": "",
+          "value": ""
+        }
+      ],
+      "week": {
+        "mon": [
+          {
+            "time": "",
+            "value": ""
+          },
+          {
+            "time": "",
+            "value": ""
+          },
+          {
+            "time": "",
+            "value": ""
+          },
+          {
+            "time": "",
+            "value": ""
+          }
+        ],
+        "tue": [
+          {
+            "time": "",
+            "value": ""
+          },
+          {
+            "time": "",
+            "value": ""
+          },
+          {
+            "time": "",
+            "value": ""
+          },
+          {
+            "time": "",
+            "value": ""
+          }
+        ],
+        "wed": [
+          {
+            "time": "",
+            "value": ""
+          },
+          {
+            "time": "",
+            "value": ""
+          },
+          {
+            "time": "",
+            "value": ""
+          },
+          {
+            "time": "",
+            "value": ""
+          }
+        ],
+        "thu": [
+          {
+            "time": "",
+            "value": ""
+          },
+          {
+            "time": "",
+            "value": ""
+          },
+          {
+            "time": "",
+            "value": ""
+          },
+          {
+            "time": "",
+            "value": ""
+          }
+        ],
+        "fri": [
+          {
+            "time": "",
+            "value": ""
+          },
+          {
+            "time": "",
+            "value": ""
+          },
+          {
+            "time": "",
+            "value": ""
+          },
+          {
+            "time": "",
+            "value": ""
+          }
+        ],
+        "sat": [
+          {
+            "time": "",
+            "value": ""
+          },
+          {
+            "time": "",
+            "value": ""
+          },
+          {
+            "time": "",
+            "value": ""
+          },
+          {
+            "time": "",
+            "value": ""
+          }
+        ],
+        "sun": [
+          {
+            "time": "",
+            "value": ""
+          },
+          {
+            "time": "",
+            "value": ""
+          },
+          {
+            "time": "",
+            "value": ""
+          },
+          {
+            "time": "",
+            "value": ""
+          }
+        ]
+      }
+    }
+  }
+}
