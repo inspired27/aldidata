@@ -12,14 +12,14 @@ from apscheduler.schedulers.background import BackgroundScheduler
 from apscheduler.triggers.cron import CronTrigger
 import pytz
 
-ALDI_USERNAME = os.getenv("ALDI_USERNAME", "")
-ALDI_PASSWORD = os.getenv("ALDI_PASSWORD", "")
+ALDI_USERNAME = os.getenv("ALDI_USERNAME", "0415100346")
+ALDI_PASSWORD = os.getenv("ALDI_PASSWORD", "PssAldiMy123!")
 
 OVERVIEW_URL   = "https://my.aldimobile.com.au/admin/s/5620272/shareddataoverview"
 LOGIN_PAGE_URL = "https://my.aldimobile.com.au/login/"
 LOGIN_POST_URL = "https://my.aldimobile.com.au/login_check"
 
-MOBILES = ["0494584269","0466008129", "0466008170"]
+MOBILES = ["0494584269","0466008129", "0466008170",]
 CONFIG_PATH = os.path.join(os.path.dirname(__file__), "schedule_matrix.json")
 
 POLL_INTERVAL_SECONDS = 2
